@@ -70,3 +70,73 @@ def change_img_size_ddp(input_folder, output_folder, resz, accelerator):
         accelerator.print(f"Total images resized: {total_change_count}")
     accelerator.wait_for_everyone()
     return total_change_count
+
+
+def change_img_size_bias(input_folder, output_folder, resz, accelerator):
+    #img_list = sorted([file for file in os.listdir(input_folder) if file.endswith('.jpg')])
+    all_images = []
+    for root, dirs, files in os.walk(input_folder):  # <-- CHANGED
+        for file in files:
+            if file.lower().endswith(".jpg"):
+                # input_folder 기준의 상대 경로를 구함
+                rel_path = os.path.relpath(os.path.join(root, file), start=input_folder)  # <-- CHANGED
+                all_images.append(rel_path)
+
+    # CHANGED: all_images를 기존처럼 정렬
+    img_list = sorted(all_images)
+    
+    # Distribute image list among ranks
+    total_images = len(img_list)
+    num_processes = accelerator.num_processes
+    rank = accelerator.process_index
+
+    images_per_process = total_images // num_processes
+    remainder = total_images % num_processes
+
+    if rank < remainder:
+        start_index = rank * (images_per_process + 1)
+        end_index = start_index + images_per_process + 1
+    else:
+        start_index = remainder * (images_per_process + 1) + (rank - remainder) * images_per_process
+        end_index = start_index + images_per_process
+
+    process_img_list = img_list[start_index:end_index]
+
+    local_change_count = 0
+
+    # Resize images assigned to this process
+    for i, filename in enumerate(process_img_list):
+        # CHANGED: 이미지 로드 시, input_folder + 상대경로
+        in_path = os.path.join(input_folder, filename)  # <-- CHANGED
+        # CHANGED: 저장 시, output_folder + 동일 상대경로 유지
+        out_path = os.path.join(output_folder, filename)  # <-- CHANGED
+
+        # CHANGED: 하위 폴더가 없을 수 있으므로 생성
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)  # <-- CHANGED
+        
+        #img = Image.open(os.path.join(input_folder, filename))
+        img = Image.open(in_path)
+        #img.save(out_path)
+        #img.resize((resz, resz)).save(os.path.join(output_folder, filename))
+        img.resize((resz, resz)).save(out_path)
+
+        img.close()
+        local_change_count += 1
+        
+        if i % 1000 == 0:
+            accelerator.print(f"Rank {rank}: {i}/{len(process_img_list)} | {filename}: resized to {resz}")
+
+    accelerator.wait_for_everyone()
+    # Convert local_change_count to a tensor
+    local_change_count_tensor = torch.tensor([local_change_count], device=accelerator.device)
+
+    # Gather the total number of resized images across all ranks
+    total_change_count_tensor = accelerator.gather(local_change_count_tensor)
+
+    # Sum the gathered tensors and convert it to a Python integer
+    total_change_count = total_change_count_tensor.sum().item()
+    if accelerator.is_main_process:
+        accelerator.print(f"Total images resized: {total_change_count}")
+    accelerator.wait_for_everyone()
+    return total_change_count
+

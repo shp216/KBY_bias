@@ -141,8 +141,8 @@ def copy_weight_from_teacher(unet_stu, unet_tea, student_type):
         connect_info['up_blocks.2.attentions.0.'] = 'up_blocks.3.attentions.0.'
         connect_info['up_blocks.2.resnets.1.'] = 'up_blocks.3.resnets.2.'
         connect_info['up_blocks.2.attentions.1.'] = 'up_blocks.3.attentions.2.'       
-    else:
-        raise NotImplementedError
+    # else:
+    #     raise NotImplementedError
 
 
     for k in unet_stu.state_dict().keys():
@@ -590,9 +590,16 @@ def main():
     unet_teacher = UNet2DConditionModel.from_pretrained(
         args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
     )
+    
+    if args.unet_config_name == "teacher":
+        config_student = unet_teacher.config
+        unet = UNet2DConditionModel.from_pretrained(
+            args.pretrained_model_name_or_path, subfolder="unet", revision=args.non_ema_revision
+        )
 
-    config_student = UNet2DConditionModel.load_config(args.unet_config_path, subfolder=args.unet_config_name)
-    unet = UNet2DConditionModel.from_config(config_student, revision=args.non_ema_revision)
+    else:
+        config_student = UNet2DConditionModel.load_config(args.unet_config_path, subfolder=args.unet_config_name)
+        unet = UNet2DConditionModel.from_config(config_student, revision=args.non_ema_revision)
 
     # Copy weights from teacher to student
     if args.use_copy_weight_from_teacher:
@@ -713,7 +720,7 @@ def main():
         mapping_layers_tea = copy.deepcopy(mapping_layers)
         mapping_layers_stu = copy.deepcopy(mapping_layers)
         
-    elif args.unet_config_name in ["bk_base", "bk_small"]:
+    elif args.unet_config_name in ["teacher", "bk_base", "bk_small"]:
         mapping_layers = ['up_blocks.0', 'up_blocks.1', 'up_blocks.2', 'up_blocks.3',
                         'down_blocks.0', 'down_blocks.1', 'down_blocks.2', 'down_blocks.3']    
         mapping_layers_tea = copy.deepcopy(mapping_layers)
@@ -756,7 +763,8 @@ def main():
         weight_decay=args.adam_weight_decay,
         eps=args.adam_epsilon,
     )
-
+    
+######################################################################## Previous Random conditioning part ##############################################################################
     train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
                                random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
                                world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
@@ -779,6 +787,33 @@ def main():
         batch_size=args.train_batch_size,
         num_workers=args.dataloader_num_workers,
     )
+#########################################################################################################################################################################################
+
+######################################################################## Bias Mitigation dataset Part ###################################################################################
+    train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
+                               random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
+                               world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
+                               use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples)
+
+    if args.max_train_samples is not None:
+        original_seed = random.getstate()
+        random.seed(42)  # 원하는 시드 값 설정
+        indices = random.sample(range(len(train_dataset)), args.max_train_samples)
+        random.setstate(original_seed)
+        print("all:", len(train_dataset))
+        train_dataset = Subset(train_dataset, indices)
+        print("Subset:", len(train_dataset))
+
+    # DataLoaders creation:
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        shuffle=True,
+        collate_fn=collate_fn(tokenizer),
+        batch_size=args.train_batch_size,
+        num_workers=args.dataloader_num_workers,
+    )
+#########################################################################################################################################################################################
+
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False

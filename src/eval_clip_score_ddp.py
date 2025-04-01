@@ -5,6 +5,7 @@ import open_clip
 from PIL import Image
 from utils.misc import get_file_list_from_csv
 from accelerate import Accelerator
+import wandb
 
 def evaluate_clip_score(args, accelerator):
     # Set seed for reproducibility
@@ -12,11 +13,18 @@ def evaluate_clip_score(args, accelerator):
     
     device = accelerator.device
 
-    # Load model and tokenizer
-    model, _, preprocess = open_clip.create_model_and_transforms('ViT-g-14',
-                                                                 pretrained='laion2b_s34b_b88k',
+    # # Load model and tokenizer
+    # model, _, preprocess = open_clip.create_model_and_transforms('ViT-g-14',
+    #                                                              pretrained='laion2b_s34b_b88k',
+    #                                                              device=device)
+    # tokenizer = open_clip.get_tokenizer('ViT-g-14')
+    
+     # Load model and tokenizer
+
+    model, _, preprocess = open_clip.create_model_and_transforms('ViT-bigG-14',
+                                                                 pretrained='laion2b_s39b_b160k',
                                                                  device=device)
-    tokenizer = open_clip.get_tokenizer('ViT-g-14')
+    tokenizer = open_clip.get_tokenizer('ViT-bigG-14')
 
     # Load the list of image paths and corresponding prompts
     file_list = get_file_list_from_csv(args.data_list)
@@ -39,7 +47,9 @@ def evaluate_clip_score(args, accelerator):
         batch_end = min(batch_start + args.clip_batch_size, len(local_file_list))
         batch_files = local_file_list[batch_start:batch_end]
 
-        img_paths = [os.path.join(img_save_dir, file_info[0]) for file_info in batch_files]
+        #img_paths = [os.path.join(img_save_dir, file_info[0]) for file_info in batch_files]
+        img_paths = [file_info[0] for file_info in batch_files]
+
         val_prompts = [file_info[1] for file_info in batch_files]
         texts = tokenizer(val_prompts).to(device)
 
@@ -73,12 +83,18 @@ def evaluate_clip_score(args, accelerator):
     # Save results (only on process 0)
     if accelerator.is_main_process:
         final_score = sum(all_scores) / len(all_scores)
+        all_scores_tensor = torch.tensor(all_scores, device=device)
+        variance_score = all_scores_tensor.var()
         # Save result in args.save_dir/im256_clip.txt
-        save_path = os.path.join(args.save_dir, 'im256_clip.txt')
-        with open(save_path, 'w') as f:
-            f.write(f"FINAL clip score {final_score}\n")
-            f.write(f"-- sum score {sum(all_scores)}\n")
-            f.write(f"-- len {len(all_scores)}\n")
+        # save_path = os.path.join(args.save_dir, 'im256_clip.txt')
+        # with open(save_path, 'w') as f:
+        #     f.write(f"FINAL clip score {final_score}\n")
+        #     f.write(f"-- sum score {sum(all_scores)}\n")
+        #     f.write(f"-- len {len(all_scores)}\n")
+        wandb.log({
+        "clip-T": final_score,
+        "clip-T-var": float(variance_score)
+        })
     accelerator.wait_for_everyone()
             
 

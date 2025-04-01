@@ -46,6 +46,25 @@ class InferencePipeline:
                 raise Exception(f"Use diffusers version as either ==0.15.0 or >=0.19 (from current {diffusers.__version__})")
 
         self.generator = torch.Generator(device=self.device).manual_seed(self.seed)
+        
+    def set_pipe_and_generator(self, SDXL): 
+        # disable NSFW filter to avoid black images, **ONLY for the benchmark evaluation**
+        if SDXL:
+            self.pipe = StableDiffusionXLPipeline.from_pretrained(self.weight_folder,
+                                                                    torch_dtype=torch.float16).to(self.device)
+        else:            
+            if diffusers_version == 15: # for the specified version in requirements.txt
+                self.pipe = StableDiffusionPipeline.from_pretrained(self.weight_folder,
+                                                                    torch_dtype=torch.float16).to(self.device)
+                self.pipe.safety_checker = lambda images, clip_input: (images, False) 
+            elif diffusers_version >= 19: # for recent diffusers versions
+                self.pipe = StableDiffusionPipeline.from_pretrained(self.weight_folder,
+                                                                    safety_checker=None, torch_dtype=torch.float16).to(self.device)
+            else: # for the versions between 0.15 and 0.19, the benchmark scores are not guaranteed.
+                raise Exception(f"Use diffusers version as either ==0.15.0 or >=0.19 (from current {diffusers.__version__})")
+
+        self.generator = torch.Generator(device=self.device).manual_seed(self.seed)
+
 
     def generate(self, prompt: Union[str, List[str]], n_steps: int, img_sz: int) -> List[Image.Image]:
         out = self.pipe(

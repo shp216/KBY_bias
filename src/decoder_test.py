@@ -5,7 +5,7 @@ from PIL import Image
 import numpy as np
 
 # VAE 모델 로드
-vae = AutoencoderKL.from_pretrained("CompVis/stable-diffusion-v1-4", subfolder="vae", revision=None)
+vae = AutoencoderKL.from_pretrained("runwayml/stable-diffusion-v1-5", subfolder="vae", revision=None)
 device = "cuda" if torch.cuda.is_available() else "cpu"
 vae.to(device)
 
@@ -35,8 +35,8 @@ def load_and_decode(latent_path, vae, device):
     return pil_image
 
 # 예시: latent 파일 경로와 저장 경로 설정
-latent_path = "data/laion_aes/pt_cache_212k/000027947_latent.pt"  # 불러올 latent pt 파일 경로
-output_image_path = "decoded_image.png"  # 저장할 이미지 파일 경로
+latent_path = "./data/x0_occupation_gender_latent/associate professor_female1_latent.pt"  # 불러올 latent pt 파일 경로
+output_image_path = "./decoded_image1.png"  # 저장할 이미지 파일 경로
 
 # Latent 파일을 디코딩하고 이미지를 저장
 decoded_image = load_and_decode(latent_path, vae, device)
