@@ -17,13 +17,13 @@ def parse_args():
     parser.add_argument("--revision", type=str, default=None, required=False,
                         help="Revision of pretrained model identifier from huggingface.co/models.")
     parser.add_argument("--max_train_samples", type=int, default=None, help="Truncate the number of training examples.")
-    parser.add_argument("--output_dir", type=str, default="./data/x0_occupation_gender_latent",
+    parser.add_argument("--output_dir", type=str, default="./data/x0_occupation_gender_240k_latent",
                         help="The output directory where the model predictions and checkpoints will be written.")
     parser.add_argument("--seed", type=int, default=1234, help="A seed for reproducible training.")
     parser.add_argument("--resolution", type=int, default=512, help="The resolution for input images.")
     parser.add_argument("--center_crop", action="store_true", help="Whether to center crop the input images.")
     parser.add_argument("--random_flip", action="store_true", help="Whether to randomly flip images horizontally.")
-    parser.add_argument("--train_batch_size", type=int, default=32, help="Batch size (per device).")
+    parser.add_argument("--train_batch_size", type=int, default=64, help="Batch size (per device).")
     parser.add_argument("--dataloader_num_workers", type=int, default=0, help="Number of workers for DataLoader.")
     args = parser.parse_args()
     print('args')
@@ -84,7 +84,7 @@ def main():
 
 
     # DataLoader 설정
-    img_dir = "./data/x0_occupation_gender"
+    img_dir = "./data/x0_occupation_gender_240k"
     
     
     print('before dataset')
@@ -113,7 +113,7 @@ def main():
             image_tensors = torch.stack(images).to(device)  # [B, C, H, W] 형태
             with torch.no_grad():
                 latents = vae.module.encode(image_tensors).latent_dist.sample() if isinstance(vae, torch.nn.parallel.DistributedDataParallel) else vae.encode(image_tensors).latent_dist.sample()
-                latents = latents * vae.config.scaling_factor  # Stable Diffusion의 scaling factor
+                latents = latents * vae.module.config.scaling_factor  # Stable Diffusion의 scaling factor
         else:
             latents = None
 

@@ -49,12 +49,14 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-from eval_clip_score_ddp import evaluate_clip_score, evaluate_clip_score_unseen_setting
 # from generate_ddp2 import sample_images_30k, sample_images_41k
 # from eval_score_wandb_log import log_eval_scores, log_eval_scores_unseen_setting
 from torchvision.utils import save_image, make_grid
-from eval_bias_image import eval_gender_images, generate_image
+from eval_bias_image import eval_gender_images
+from eval_bias_image_miil import eval_from_csv
 from eval_bias_score import evaluate_biased_score
+from eval_clip_score_miil import evaluate_clip_score
+
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DPMSolverMultistepScheduler
@@ -70,8 +72,6 @@ import json
 import glob
 
 from x0_dataset_gender import x0_dataset, collate_fn
-from x0_dataset_gender_laion import x0_dataset_laion
-
 #from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
 
 import warnings
@@ -211,26 +211,6 @@ def parse_args():
         "--num_train_x0",
         type=str,
         default="240K",
-    )
-    parser.add_argument(
-        "--use_laion",
-        action="store_true",
-        help="use laion dataset for training",
-    )
-    parser.add_argument(
-        "--use_linear_timestep",
-        action="store_true",
-        help="use linear timestep sampling",
-    )
-    parser.add_argument(
-        "--use_exp_timestep",
-        action="store_true",
-        help="use exp timestep sampling",
-    )
-    parser.add_argument(
-        "--use_timestep_900",
-        action="store_true",
-        help="use timestep 900 up",
     )
     parser.add_argument(
         "--use_multi_templates",
@@ -520,12 +500,6 @@ def parse_args():
     
     ########################################################### evaluation parser ###########################################################
     parser.add_argument(
-        "--attribute",
-        type=str,
-        default=None,
-        required=True
-    )
-    parser.add_argument(
         "--load_text_encoder_lora_from",
         type=str,
         default=None,
@@ -603,6 +577,11 @@ def parse_args():
         type=str,
         default=None,
         help="provide the checkpoint path to resume from checkpoint",
+    )
+    parser.add_argument(
+        "--eval_csv_path",
+        type=str,
+        default="./data/bias_eval/bias_eval_gender.csv",
     )
     parser.add_argument(
         "--rank",
@@ -955,22 +934,10 @@ def main():
     )
 
 ######################################################################## Bias Mitigation dataset Part ###################################################################################
-    if args.use_laion:
-        train_dataset = x0_dataset_laion(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
-                                random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
-                                world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep)
-        print("Use Laion for main training data!!")
-    else:
-        train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
-                                random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
-                                world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                num_train_x0=args.num_train_x0, use_multi_templates=args.use_multi_templates,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep, use_timestep_900=args.use_timestep_900)
-        print("Use occupation data for main training data!!")
-
+    train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
+                               random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
+                               world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
+                               use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples, num_train_x0=args.num_train_x0, use_multi_templates=args.use_multi_templates)
 
     if args.max_train_samples is not None:
         original_seed = random.getstate()
@@ -1020,8 +987,8 @@ def main():
             conv_module = conv_layers
         
     else:
-        unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, optimizer, train_dataloader, lr_scheduler
+        text_encoder, unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            text_encoder, unet, optimizer, train_dataloader, lr_scheduler
         )
         
     
@@ -1051,6 +1018,26 @@ def main():
     text_encoder.to(accelerator.device, dtype=weight_dtype)
     vae.to(accelerator.device, dtype=weight_dtype)
     unet_teacher.to(accelerator.device, dtype=weight_dtype)
+
+    if args.load_text_encoder_lora_from is not None:
+        # 1) float32로 임시 변환
+        text_encoder.to(accelerator.device, dtype=torch.float32)
+        
+        # 2) LoRA patch
+        text_encoder_lora_params = LoraLoaderMixin._modify_text_encoder(
+            text_encoder, dtype=torch.float32, rank=args.rank, patch_mlp=True
+        )
+        
+        # 3) 로드
+        
+        text_encoder_lora_dict = torch.load(
+            args.load_text_encoder_lora_from, 
+            map_location=accelerator.device
+        )
+        text_encoder.load_state_dict(text_encoder_lora_dict, strict=False)
+        
+        # 4) 다시 weight_dtype (예: fp16)으로 변환
+        text_encoder.to(accelerator.device, dtype=weight_dtype)
 
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
@@ -1119,8 +1106,7 @@ def main():
 
     # get wandb_tracker (if it exists)
     wandb_tracker = accelerator.get_tracker("wandb")
-    #male_cnt=0
-    #female_cnt=0
+
     for epoch in range(first_epoch, args.num_train_epochs):
 
         unet.train()
@@ -1138,189 +1124,180 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
-                # for i in batch["genders"]:
-                #     if i == "male":
-                #         male_cnt += 1
-                #     else:
-                #         female_cnt += 1
-                # Convert images to latent space
-                latents = batch["latents"].to(weight_dtype)
+            #     # Convert images to latent space
+            #     latents = batch["latents"].to(weight_dtype)
 
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(latents)
-                # Sample a random timestep for each image
-                timesteps = batch["timesteps"]
+            #     # Sample noise that we'll add to the latents
+            #     noise = torch.randn_like(latents)
+            #     # Sample a random timestep for each image
+            #     timesteps = batch["timesteps"]
                 
-                # Add noise to the latents according to the noise magnitude at each timestep
-                # (this is the forward diffusion process)
-                noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            #     # Add noise to the latents according to the noise magnitude at each timestep
+            #     # (this is the forward diffusion process)
+            #     noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
 
-                # Get the text embedding for conditioning
-                encoder_hidden_states_teacher = text_encoder(batch["teacher_input_ids"])[0]
-                encoder_hidden_states_student = text_encoder(batch["student_input_ids"])[0]
-                # encoder_hidden_states = batch["text_embs"].to(weight_dtype)
+            #     # Get the text embedding for conditioning
+            #     encoder_hidden_states_teacher = text_encoder(batch["teacher_input_ids"])[0]
+            #     encoder_hidden_states_student = text_encoder(batch["student_input_ids"])[0]
+            #     # encoder_hidden_states = batch["text_embs"].to(weight_dtype)
 
-                # Get the target for loss depending on the prediction type
-                if noise_scheduler.config.prediction_type == "epsilon":
-                    target = noise
-                elif noise_scheduler.config.prediction_type == "v_prediction":
-                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:
-                    raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
+            #     # Get the target for loss depending on the prediction type
+            #     if noise_scheduler.config.prediction_type == "epsilon":
+            #         target = noise
+            #     elif noise_scheduler.config.prediction_type == "v_prediction":
+            #         target = noise_scheduler.get_velocity(latents, noise, timesteps)
+            #     else:
+            #         raise ValueError(f"Unknown prediction type {noise_scheduler.config.prediction_type}")
                 
-                ################################################## loss calculation ####################################################################
+            #     ################################################## loss calculation ####################################################################
 
-                # Predict the noise residual and compute loss
-                model_pred = unet(noisy_latents, timesteps, encoder_hidden_states_student).sample
-                if args.use_sd_loss:
-                    paireds = batch['paireds']
-                    mask = (paireds == 1)
-                    model_pred_ = model_pred[mask]
-                    target_ = target[mask]
-                    if model_pred_.numel() > 0:  # 필터링된 요소가 있는지 확인
-                        loss_sd = F.mse_loss(model_pred_.float(), target_.float(), reduction="mean")
-                    else:
-                        loss_sd = torch.tensor(0.0, device=accelerator.device)
-                else:
-                    loss_sd = torch.tensor(0.0, device=accelerator.device)  # If not using, set to zero
+            #     # Predict the noise residual and compute loss
+            #     model_pred = unet(noisy_latents, timesteps, encoder_hidden_states_student).sample
+            #     if args.use_sd_loss:
+            #         paireds = batch['paireds']
+            #         mask = (paireds == 1)
+            #         model_pred_ = model_pred[mask]
+            #         target_ = target[mask]
+            #         if model_pred_.numel() > 0:  # 필터링된 요소가 있는지 확인
+            #             loss_sd = F.mse_loss(model_pred_.float(), target_.float(), reduction="mean")
+            #         else:
+            #             loss_sd = torch.tensor(0.0, device=accelerator.device)
+            #     else:
+            #         loss_sd = torch.tensor(0.0, device=accelerator.device)  # If not using, set to zero
 
-                # Predict output-KD loss
-                model_pred_teacher = unet_teacher(noisy_latents, timesteps, encoder_hidden_states_teacher).sample
-                loss_kd_output = F.mse_loss(model_pred.float(), model_pred_teacher.float(), reduction="mean")
+            #     # Predict output-KD loss
+            #     model_pred_teacher = unet_teacher(noisy_latents, timesteps, encoder_hidden_states_teacher).sample
+            #     loss_kd_output = F.mse_loss(model_pred.float(), model_pred_teacher.float(), reduction="mean")
 
-                # Predict feature-KD loss
-                losses_kd_feat = []
-                #print("##########################################################################################")
-                for i, (m_tea, m_stu) in enumerate(zip(mapping_layers_tea, mapping_layers_stu)):
+            #     # Predict feature-KD loss
+            #     losses_kd_feat = []
+            #     #print("##########################################################################################")
+            #     for i, (m_tea, m_stu) in enumerate(zip(mapping_layers_tea, mapping_layers_stu)):
 
-                    a_tea = acts_tea[m_tea]
-                    a_stu = acts_stu[m_stu]
+            #         a_tea = acts_tea[m_tea]
+            #         a_stu = acts_stu[m_stu]
                     
-                    if type(a_tea) is tuple: a_tea = a_tea[0]                        
-                    if type(a_stu) is tuple: a_stu = a_stu[0]
+            #         if type(a_tea) is tuple: a_tea = a_tea[0]                        
+            #         if type(a_stu) is tuple: a_stu = a_stu[0]
                     
-                    if args.channel_mapping:
-                        a_stu_ = conv_module.convs[i](a_stu.to(conv_module.convs[i].weight.dtype))
-                        # a_stu_ = a_stu_.to(a_tea.dtype)
-                        tmp = F.mse_loss(a_stu_.float(), a_tea.detach().float(), reduction="mean")
-                    else:
-                        # print(f"Layer teacher: {m_tea}, student: {m_stu}")
-                        # print(f"a_tea shape: {a_tea.shape}, a_stu shape: {a_stu.shape}")
-                        # print(f"After channel mapping, a_stu_ shape: {a_stu.shape}, a_tea shape: {a_tea.shape}")
-                        tmp = F.mse_loss(a_stu.float(), a_tea.detach().float(), reduction="mean")
-                    losses_kd_feat.append(tmp)
+            #         if args.channel_mapping:
+            #             a_stu_ = conv_module.convs[i](a_stu.to(conv_module.convs[i].weight.dtype))
+            #             # a_stu_ = a_stu_.to(a_tea.dtype)
+            #             tmp = F.mse_loss(a_stu_.float(), a_tea.detach().float(), reduction="mean")
+            #         else:
+            #             # print(f"Layer teacher: {m_tea}, student: {m_stu}")
+            #             # print(f"a_tea shape: {a_tea.shape}, a_stu shape: {a_stu.shape}")
+            #             # print(f"After channel mapping, a_stu_ shape: {a_stu.shape}, a_tea shape: {a_tea.shape}")
+            #             tmp = F.mse_loss(a_stu.float(), a_tea.detach().float(), reduction="mean")
+            #         losses_kd_feat.append(tmp)
                 
-                    #print(a_tea.shape)
-                #print("##########################################################################################")
+            #         #print(a_tea.shape)
+            #     #print("##########################################################################################")
 
-                loss_kd_feat = sum(losses_kd_feat)
+            #     loss_kd_feat = sum(losses_kd_feat)
 
-                # Compute the final loss
-                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
-                # loss = args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
+            #     # Compute the final loss
+            #     loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
+            #     # loss = args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
 
-                ################################################## loss calculation ####################################################################
+            #     ################################################## loss calculation ####################################################################
 
-                # Gather the losses across all processes for logging (if we use distributed training).
-                avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
-                train_loss += avg_loss.item() / args.gradient_accumulation_steps
+            #     # Gather the losses across all processes for logging (if we use distributed training).
+            #     avg_loss = accelerator.gather(loss.repeat(args.train_batch_size)).mean()
+            #     train_loss += avg_loss.item() / args.gradient_accumulation_steps
 
-                avg_loss_sd = accelerator.gather(loss_sd.repeat(args.train_batch_size)).mean()
-                train_loss_sd += avg_loss_sd.item() / args.gradient_accumulation_steps
+            #     avg_loss_sd = accelerator.gather(loss_sd.repeat(args.train_batch_size)).mean()
+            #     train_loss_sd += avg_loss_sd.item() / args.gradient_accumulation_steps
 
-                avg_loss_kd_output = accelerator.gather(loss_kd_output.repeat(args.train_batch_size)).mean()
-                train_loss_kd_output += avg_loss_kd_output.item() / args.gradient_accumulation_steps
+            #     avg_loss_kd_output = accelerator.gather(loss_kd_output.repeat(args.train_batch_size)).mean()
+            #     train_loss_kd_output += avg_loss_kd_output.item() / args.gradient_accumulation_steps
 
-                avg_loss_kd_feat = accelerator.gather(loss_kd_feat.repeat(args.train_batch_size)).mean()
-                train_loss_kd_feat += avg_loss_kd_feat.item() / args.gradient_accumulation_steps
+            #     avg_loss_kd_feat = accelerator.gather(loss_kd_feat.repeat(args.train_batch_size)).mean()
+            #     train_loss_kd_feat += avg_loss_kd_feat.item() / args.gradient_accumulation_steps
 
-                # Backpropagate
-                accelerator.backward(loss)
-                if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
-                optimizer.step()
-                lr_scheduler.step()
-                optimizer.zero_grad()
+            #     # Backpropagate
+            #     accelerator.backward(loss)
+            #     if accelerator.sync_gradients:
+            #         accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+            #     optimizer.step()
+            #     lr_scheduler.step()
+            #     optimizer.zero_grad()
 
-            # Checks if the accelerator has performed an optimization step behind the scenes
-            if accelerator.sync_gradients:
-                if args.use_ema:
-                    ema_unet.step(unet.parameters())
-                progress_bar.update(1)
-                global_step += 1
-                accelerator.log(
-                    {
-                        "train_loss": train_loss, 
-                        "train_loss_sd": train_loss_sd,
-                        "train_loss_kd_output": train_loss_kd_output,
-                        "train_loss_kd_feat": train_loss_kd_feat,
-                        "lr": lr_scheduler.get_last_lr()[0]
-                    }, 
-                    step=global_step
-                )
+            # # Checks if the accelerator has performed an optimization step behind the scenes
+            # if accelerator.sync_gradients:
+            #     if args.use_ema:
+            #         ema_unet.step(unet.parameters())
+            #     progress_bar.update(1)
+            #     global_step += 1
+            #     accelerator.log(
+            #         {
+            #             "train_loss": train_loss, 
+            #             "train_loss_sd": train_loss_sd,
+            #             "train_loss_kd_output": train_loss_kd_output,
+            #             "train_loss_kd_feat": train_loss_kd_feat,
+            #             "lr": lr_scheduler.get_last_lr()[0]
+            #         }, 
+            #         step=global_step
+            #     )
 
-                if accelerator.is_main_process:
-                    with open(csv_log_path, 'a') as logfile:
-                        logwriter = csv.writer(logfile, delimiter=',')
-                        logwriter.writerow([epoch, step, global_step,
-                                            train_loss, train_loss_sd, train_loss_kd_output, train_loss_kd_feat,
-                                            lr_scheduler.get_last_lr()[0],
-                                            args.lambda_sd, args.lambda_kd_output, args.lambda_kd_feat])
+            #     if accelerator.is_main_process:
+            #         with open(csv_log_path, 'a') as logfile:
+            #             logwriter = csv.writer(logfile, delimiter=',')
+            #             logwriter.writerow([epoch, step, global_step,
+            #                                 train_loss, train_loss_sd, train_loss_kd_output, train_loss_kd_feat,
+            #                                 lr_scheduler.get_last_lr()[0],
+            #                                 args.lambda_sd, args.lambda_kd_output, args.lambda_kd_feat])
 
-                train_loss = 0.0
-                train_loss_sd = 0.0
-                train_loss_kd_output = 0.0
-                train_loss_kd_feat = 0.0
+            #     train_loss = 0.0
+            #     train_loss_sd = 0.0
+            #     train_loss_kd_output = 0.0
+            #     train_loss_kd_feat = 0.0
 
-                torch.cuda.empty_cache()
-                if global_step % args.checkpointing_steps == 0:
-                    torch.cuda.empty_cache()
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    if accelerator.is_main_process:
-                        accelerator.save_state(save_path)
-                        logger.info(f"Saved state to {save_path}")
-                        #os.makedirs(args.save_dir, exist_ok=True)
-                    accelerator.wait_for_everyone()
+            #     torch.cuda.empty_cache()
+            #     if global_step % args.checkpointing_steps == 0:
+            #         torch.cuda.empty_cache()
+            #         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
+            #         if accelerator.is_main_process:
+            #             accelerator.save_state(save_path)
+            #             logger.info(f"Saved state to {save_path}")
+            #             #os.makedirs(args.save_dir, exist_ok=True)
+            #         accelerator.wait_for_everyone()
                     
                 if global_step % args.evaluation_step==0: 
-                    #print(f"male: {male_cnt}, female: {female_cnt}")
-                    #male_cnt = 0
-                    #female_cnt = 0
-                    with open(args.prompts_path, 'r') as f:
-                        experiment_data = json.load(f)
-                    for num in range(len(experiment_data["prompt_templates_test"])):     
-                        eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, i=num)
-                        accelerator.wait_for_everyone()
+                    eval_from_csv(
+                        args=args,
+                        accelerator=accelerator,
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        unet=unet,
+                        vae=vae,
+                        noise_scheduler=eval_noise_scheduler,
+                    )
+                    accelerator.wait_for_everyone()
                         
-                        if accelerator.is_main_process:
-                            # eval-generated-images.py 의 parse_args 함수 호출
-                            bias_mean, bias_var = evaluate_biased_score(args, accelerator, i=num, attribute=args.attribute)
-                            print(f"bias mean, var: {bias_mean}, {bias_var}")
-                        time.sleep(5)
-                        accelerator.wait_for_everyone()
-                        clip_mean, clip_var = evaluate_clip_score(args, accelerator, i=num)
-                        print(f"clip mean, var: {clip_mean}, {clip_var}")
+                    if accelerator.is_main_process:
+                        # eval-generated-images.py 의 parse_args 함수 호출
+                        bias_mean, bias_var = evaluate_biased_score(args, accelerator)
+                        print(f"bias mean, var: {bias_mean}, {bias_var}")
+                    time.sleep(5)
+                    accelerator.wait_for_everyone()
+                    clip_mean, clip_var = evaluate_clip_score(args, accelerator)
+                    print(f"clip mean, var: {clip_mean}, {clip_var}")
 
-                        if accelerator.is_main_process:
-                            with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
-                                f.write(f'Template: {experiment_data["prompt_templates_test"][num]}\nbias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
-                            wandb_tracker.log({
-                                f"bias_mean": float(bias_mean),
-                                f"bias_var": float(bias_var),
-                                f"clip_mean": float(clip_mean),
-                                f"clip_var": float(clip_var),
-                            }, step=global_step, sync=False)                        
-                        accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
+                            f.write(f'bias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
+                    accelerator.wait_for_everyone()
 
-                        if accelerator.is_main_process:
-                            if os.path.exists(args.eval_save_dir):
-                                shutil.rmtree(args.eval_save_dir)
-                            if os.path.exists(args.eval_save_dir_256):
-                                shutil.rmtree(args.eval_save_dir_256)
-                            if os.path.exists(args.test_results_dir):
-                                shutil.rmtree(args.test_results_dir)
-                        accelerator.wait_for_everyone()
-                    
+                    if accelerator.is_main_process:
+                        if os.path.exists(args.eval_save_dir):
+                            shutil.rmtree(args.eval_save_dir)
+                        if os.path.exists(args.eval_save_dir_256):
+                            shutil.rmtree(args.eval_save_dir_256)
+                        if os.path.exists(args.test_results_dir):
+                            shutil.rmtree(args.test_results_dir)
+                    accelerator.wait_for_everyone()   
+
                 if global_step % args.valid_steps==0:      
                     eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, mode="eval_images")
                     accelerator.wait_for_everyone()

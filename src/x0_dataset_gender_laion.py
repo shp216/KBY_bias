@@ -7,12 +7,14 @@ from safetensors.torch import load_file
 import random
 import numpy as np
 import json
+import pickle
 
-class x0_dataset(Dataset):
+class x0_dataset_laion(Dataset):
     def __init__(self, data_dir, extra_text_dir=None, n_T=1000, random_conditioning = False, 
                  random_conditioning_lambda=5, world_size=1, rank=0, drop_text=True, drop_text_p=0.1, 
-                 use_unseen_setting=False, gpt_caption=False, max_extra_text_samples=None, safe_tensor=None, num_train_x0="240K",
-                 use_multi_templates=None, use_linear_timestep=None, use_exp_timestep=None, use_timestep_900=None):
+                 use_unseen_setting=False, gpt_caption=False, max_extra_text_samples=None, safe_tensor=None,
+                 use_linear_timestep=None, use_exp_timestep=None
+                ):
         """
         Args:
             data_dir (str): 데이터가 저장된 폴더의 경로.
@@ -29,86 +31,59 @@ class x0_dataset(Dataset):
         self.gpt_caption = gpt_caption
         self.max_extra_text_samples = max_extra_text_samples
         self.safe_tensor = safe_tensor
-        self.use_multi_templates = use_multi_templates
         self.use_linear_timestep = use_linear_timestep
         self.use_exp_timestep = use_exp_timestep
-        self.use_timestep_900 = use_timestep_900
 
-        self.num_train_x0 = num_train_x0
+        if self.use_exp_timestep:
+            print("use exp timestep!!")
         
         # select metadata
-        if self.num_train_x0 == "8K":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_8k.csv") #occupation 240k dataset
-        elif self.num_train_x0 == "4K":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_4k.csv") #occupation 24k dataset
-        elif self.num_train_x0 == "2K":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_2k.csv") #occupation 24k dataset
-        elif self.num_train_x0 == "200":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_200.csv") #occupation 24k dataset
-        elif self.num_train_x0 == "4":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_4.csv") #occupation 24k dataset
-        else:
-            raise ValueError(f"Invalid num_train_x0 value: {self.num_train_x0}. Expected one of ['8K', '4K', '2K', '200']")
-
-        print(f"Using data dir in {metadata_path}!!!!!")
+        metadata_path = os.path.join(data_dir, "metadata.csv")
         self.metadata = pd.read_csv(metadata_path)
-        if self.random_conditioning:
-            print("Use occupation random conditioning!!!")
-        
+        # metadata_path2 = os.path.join(data_dir, "bias_gender_miil.csv")
+        # self.metadata2 = pd.read_csv(metadata_path2)
+        #metadata_path2 = os.path.join("./data/bias_train/bias_gender_miil.csv")
+        #metadata_path1 = os.path.join("./data/x0_occupation_gender_miil_24k.csv")
+        #self.metadata1 = pd.read_csv(metadata_path1)
         self.text_data = []
         
         with open('./data/1-prompts/occupation.json', 'r') as f:
             self.occupation_json = json.load(f)
         self.occupations = self.occupation_json["occupations_train_set"]
-            
+             
+    
     def __len__(self):
         # 유효한 인덱스 개수를 반환합니다.+
         return len(self.metadata)
 
     def __getitem__(self, idx):
         # 인덱스에 해당하는 데이터 파일들을 로드하여 반환합니다.
+        #random_idx = torch.randint(0, len(self.metadata2), (1,)).item()
         metadata_row = self.metadata.iloc[idx]
         file_name = metadata_row['file_name']
-        #teacher_text = metadata_row['prompt']
-        gender = metadata_row['gender']
-        occupation = metadata_row['occupation']
+        if idx % 2 == 0:
+            gender = "male"
+        else:
+            gender = "female"
+        occup_index = torch.randint(0, len(self.occupations), (1,)).long()
+        occupation = self.occupations[occup_index]
+
         prompt_template_teacher = self.occupation_json["prompt_templates_train_teacher"][0]  # 템플릿 불러오기
         prompt_template_student = self.occupation_json["prompt_templates_train_student"][0]  # 템플릿 불러오기
-
-        # if self.num_train_x0 == "4":
-        #     # 1) 원본 file_name의 latent 로드
-        #     latent_path1 = os.path.join(self.data_dir, file_name.replace('.png', '_latent.pt'))
-        #     latent1 = torch.load(latent_path1, map_location='cpu')
-
-        #     # 2) 처음 4개 행에서 같은 gender를 가진 다른 파일 이름만 추출
-        #     first_four = self.metadata.iloc[:4]
-        #     same_gender_idxs = first_four.index[first_four['gender'] == gender].tolist()
-        #     same_gender_idxs = [i for i in same_gender_idxs if first_four.iloc[i]['file_name'] != file_name]
-
-        #     # 3) 나머지 중 하나를 랜덤 선택
-        #     other_idx = random.choice(same_gender_idxs)
-
-        #     # 4) 선택된 다른 샘플의 latent 로드
-        #     other_file = first_four.iloc[other_idx]['file_name']
-        #     latent_path2 = os.path.join(self.data_dir, other_file.replace('.png', '_latent.pt'))
-        #     latent2 = torch.load(latent_path2, map_location='cpu')
-
-        #     # 5) 0~1 사이를 균일분포로 뽑아 블렌딩
-        #     alpha = torch.rand(1)
-        #     latent_tensor = alpha * latent1 + (1 - alpha) * latent2
-        # else:
+    
         if self.safe_tensor:
-            latent_file_name = file_name.replace('.png', '_latent.safetensors')
+            latent_file_name = file_name.replace('.jpg', '_latent.safetensors')
             latent_path = os.path.join(self.data_dir, latent_file_name)
             data = load_file(latent_path)
             latent_tensor = data["tensor"]
 
         else:
             # Modify the file_name to get latent file name
-            latent_file_name = file_name.replace('.png', '_latent.pt')
+            latent_file_name = file_name.replace('.jpg', '_latent.pt')
             latent_path = os.path.join(self.data_dir, latent_file_name)
             
             latent_tensor = torch.load(latent_path, map_location=torch.device('cpu'))
+            
 
         #timestep = torch.randint(0, self.n_T, (1,)).long()  
         if self.use_linear_timestep:
@@ -123,14 +98,29 @@ class x0_dataset(Dataset):
             timestep = torch.multinomial(probs, 1).long()
         else:
             timestep = torch.randint(0, self.n_T, (1,)).long()
- 
-        paired = torch.tensor(1).unsqueeze(0)
-
-        if self.random_conditioning:
-            occup_index = torch.randint(0, len(self.occupations), (1,)).long()
-            occupation = self.occupations[occup_index]
-            paired = torch.tensor(0).unsqueeze(0)
         
+        paired = torch.tensor(1).unsqueeze(0)
+        if self.random_conditioning:
+            t_value = timestep.item()
+            #p = math.exp(-self.random_conditioning_lambda * (1 - t_value / self.n_T)) #random conditioning
+            p = 1
+            if torch.rand(1).item() < p:
+                #rand_index = torch.randint(0, len(self.data_indices), (1,)).item()
+                #random_idx = torch.randint(0, len(self.metadata2), (1,)).item()
+                selected_row = self.metadata1.iloc[idx]  # .iloc 사용해서 행 접근
+                gender = selected_row['gender']
+                occupation = selected_row['occupation']
+                teacher_text = prompt_template_teacher.format(gender=gender, occupation=occupation)
+                student_text = prompt_template_student.format(occupation=occupation)
+                #print(f"student text: {student_text}\ntimestep: {t_value}")
+                # #선택된 행의 정보 가져오기 (DataFrame 형태를 가정)
+                # selected_row = self.metadata2.iloc[random_idx]  # .iloc 사용해서 행 접근
+
+                # teacher_text = selected_row['teacher_prompt']
+                # student_text = selected_row['student_prompt'] 
+        
+                paired = torch.tensor(0).unsqueeze(0)
+
         teacher_text = prompt_template_teacher.format(gender=gender, occupation=occupation)
         student_text = prompt_template_student.format(occupation=occupation)
         

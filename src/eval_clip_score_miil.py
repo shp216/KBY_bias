@@ -7,26 +7,15 @@ from utils.misc import get_file_list_from_csv
 from accelerate import Accelerator
 import wandb
 import json
+import pandas as pd
 
-def get_file_list_from_experiment_data(args, i):
-    """
-    Generates (img_path, prompt) pairs dynamically based on experiment_data
-    instead of reading from CSV.
-    """
-    with open(args.prompts_path, 'r') as f:
-        experiment_data = json.load(f)
-
-    template = experiment_data["prompt_templates_test"][i]
-    occupations = experiment_data["occupations_test_set"]
-    num_images_per_prompt = args.num_imgs_per_prompt  # 예: 60
-
+def get_file_list_from_csv(args):
+    df = pd.read_csv(args.eval_csv_path)
     file_list = []
-    for i, occupation in enumerate(occupations):
-        prompt = template.format(occupation=occupation)
-        for j in range(num_images_per_prompt):
-            img_path = os.path.join(args.eval_save_dir_256, f'prompt_{i}', f'img_{j}.jpg')
-            file_list.append((img_path, prompt))
-    
+    for _, row in df.iterrows():
+        img_path = os.path.join(args.eval_save_dir_256, row['file_name'])  # full image path
+        prompt = row['prompt']
+        file_list.append((img_path, prompt))
     return file_list
 
 
@@ -52,7 +41,7 @@ def evaluate_clip_score(args, accelerator, i=None):
 
     # Load the list of image paths and corresponding prompts
     #file_list = get_file_list_from_csv(args.data_list)
-    file_list = get_file_list_from_experiment_data(args, i)
+    file_list = get_file_list_from_csv(args)
 
     # # Distribute file_list among processes manually
     # world_size = accelerator.num_processes

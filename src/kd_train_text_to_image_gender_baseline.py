@@ -69,7 +69,7 @@ import copy
 import json
 import glob
 
-from x0_dataset_gender import x0_dataset, collate_fn
+from x0_dataset_gender_baseline import x0_dataset_baseline, collate_fn
 from x0_dataset_gender_laion import x0_dataset_laion
 
 #from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
@@ -520,12 +520,6 @@ def parse_args():
     
     ########################################################### evaluation parser ###########################################################
     parser.add_argument(
-        "--attribute",
-        type=str,
-        default=None,
-        required=True
-    )
-    parser.add_argument(
         "--load_text_encoder_lora_from",
         type=str,
         default=None,
@@ -963,7 +957,7 @@ def main():
                                 use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep)
         print("Use Laion for main training data!!")
     else:
-        train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
+        train_dataset = x0_dataset_baseline(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
                                 random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
                                 world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
                                 use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
@@ -1184,39 +1178,39 @@ def main():
                 else:
                     loss_sd = torch.tensor(0.0, device=accelerator.device)  # If not using, set to zero
 
-                # Predict output-KD loss
-                model_pred_teacher = unet_teacher(noisy_latents, timesteps, encoder_hidden_states_teacher).sample
-                loss_kd_output = F.mse_loss(model_pred.float(), model_pred_teacher.float(), reduction="mean")
+                # # Predict output-KD loss
+                # model_pred_teacher = unet_teacher(noisy_latents, timesteps, encoder_hidden_states_teacher).sample
+                # loss_kd_output = F.mse_loss(model_pred.float(), model_pred_teacher.float(), reduction="mean")
 
-                # Predict feature-KD loss
-                losses_kd_feat = []
-                #print("##########################################################################################")
-                for i, (m_tea, m_stu) in enumerate(zip(mapping_layers_tea, mapping_layers_stu)):
+                # # Predict feature-KD loss
+                # losses_kd_feat = []
+                # #print("##########################################################################################")
+                # for i, (m_tea, m_stu) in enumerate(zip(mapping_layers_tea, mapping_layers_stu)):
 
-                    a_tea = acts_tea[m_tea]
-                    a_stu = acts_stu[m_stu]
+                #     a_tea = acts_tea[m_tea]
+                #     a_stu = acts_stu[m_stu]
                     
-                    if type(a_tea) is tuple: a_tea = a_tea[0]                        
-                    if type(a_stu) is tuple: a_stu = a_stu[0]
+                #     if type(a_tea) is tuple: a_tea = a_tea[0]                        
+                #     if type(a_stu) is tuple: a_stu = a_stu[0]
                     
-                    if args.channel_mapping:
-                        a_stu_ = conv_module.convs[i](a_stu.to(conv_module.convs[i].weight.dtype))
-                        # a_stu_ = a_stu_.to(a_tea.dtype)
-                        tmp = F.mse_loss(a_stu_.float(), a_tea.detach().float(), reduction="mean")
-                    else:
-                        # print(f"Layer teacher: {m_tea}, student: {m_stu}")
-                        # print(f"a_tea shape: {a_tea.shape}, a_stu shape: {a_stu.shape}")
-                        # print(f"After channel mapping, a_stu_ shape: {a_stu.shape}, a_tea shape: {a_tea.shape}")
-                        tmp = F.mse_loss(a_stu.float(), a_tea.detach().float(), reduction="mean")
-                    losses_kd_feat.append(tmp)
+                #     if args.channel_mapping:
+                #         a_stu_ = conv_module.convs[i](a_stu.to(conv_module.convs[i].weight.dtype))
+                #         # a_stu_ = a_stu_.to(a_tea.dtype)
+                #         tmp = F.mse_loss(a_stu_.float(), a_tea.detach().float(), reduction="mean")
+                #     else:
+                #         # print(f"Layer teacher: {m_tea}, student: {m_stu}")
+                #         # print(f"a_tea shape: {a_tea.shape}, a_stu shape: {a_stu.shape}")
+                #         # print(f"After channel mapping, a_stu_ shape: {a_stu.shape}, a_tea shape: {a_tea.shape}")
+                #         tmp = F.mse_loss(a_stu.float(), a_tea.detach().float(), reduction="mean")
+                #     losses_kd_feat.append(tmp)
                 
-                    #print(a_tea.shape)
-                #print("##########################################################################################")
+                #     #print(a_tea.shape)
+                # #print("##########################################################################################")
 
-                loss_kd_feat = sum(losses_kd_feat)
+                # loss_kd_feat = sum(losses_kd_feat)
 
                 # Compute the final loss
-                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
+                loss = args.lambda_sd * loss_sd
                 # loss = args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
 
                 ################################################## loss calculation ####################################################################
@@ -1228,11 +1222,11 @@ def main():
                 avg_loss_sd = accelerator.gather(loss_sd.repeat(args.train_batch_size)).mean()
                 train_loss_sd += avg_loss_sd.item() / args.gradient_accumulation_steps
 
-                avg_loss_kd_output = accelerator.gather(loss_kd_output.repeat(args.train_batch_size)).mean()
-                train_loss_kd_output += avg_loss_kd_output.item() / args.gradient_accumulation_steps
+                # avg_loss_kd_output = accelerator.gather(loss_kd_output.repeat(args.train_batch_size)).mean()
+                # train_loss_kd_output += avg_loss_kd_output.item() / args.gradient_accumulation_steps
 
-                avg_loss_kd_feat = accelerator.gather(loss_kd_feat.repeat(args.train_batch_size)).mean()
-                train_loss_kd_feat += avg_loss_kd_feat.item() / args.gradient_accumulation_steps
+                # avg_loss_kd_feat = accelerator.gather(loss_kd_feat.repeat(args.train_batch_size)).mean()
+                # train_loss_kd_feat += avg_loss_kd_feat.item() / args.gradient_accumulation_steps
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1252,8 +1246,6 @@ def main():
                     {
                         "train_loss": train_loss, 
                         "train_loss_sd": train_loss_sd,
-                        "train_loss_kd_output": train_loss_kd_output,
-                        "train_loss_kd_feat": train_loss_kd_feat,
                         "lr": lr_scheduler.get_last_lr()[0]
                     }, 
                     step=global_step
@@ -1263,7 +1255,7 @@ def main():
                     with open(csv_log_path, 'a') as logfile:
                         logwriter = csv.writer(logfile, delimiter=',')
                         logwriter.writerow([epoch, step, global_step,
-                                            train_loss, train_loss_sd, train_loss_kd_output, train_loss_kd_feat,
+                                            train_loss, train_loss_sd, 
                                             lr_scheduler.get_last_lr()[0],
                                             args.lambda_sd, args.lambda_kd_output, args.lambda_kd_feat])
 
@@ -1294,7 +1286,7 @@ def main():
                         
                         if accelerator.is_main_process:
                             # eval-generated-images.py 의 parse_args 함수 호출
-                            bias_mean, bias_var = evaluate_biased_score(args, accelerator, i=num, attribute=args.attribute)
+                            bias_mean, bias_var = evaluate_biased_score(args, accelerator, i=num)
                             print(f"bias mean, var: {bias_mean}, {bias_var}")
                         time.sleep(5)
                         accelerator.wait_for_everyone()
@@ -1342,8 +1334,6 @@ def main():
 
             logs = {"step_loss": loss.detach().item(),
                     "sd_loss": loss_sd.detach().item(),
-                    "kd_output_loss": loss_kd_output.detach().item(),
-                    "kd_feat_loss": loss_kd_feat.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.wait_for_everyone()

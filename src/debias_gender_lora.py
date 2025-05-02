@@ -49,12 +49,15 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-from eval_clip_score_ddp import evaluate_clip_score, evaluate_clip_score_unseen_setting
+
 # from generate_ddp2 import sample_images_30k, sample_images_41k
 # from eval_score_wandb_log import log_eval_scores, log_eval_scores_unseen_setting
 from torchvision.utils import save_image, make_grid
-from eval_bias_image import eval_gender_images, generate_image
+from eval_bias_image import eval_gender_images
+from eval_bias_image_miil import eval_from_csv
 from eval_bias_score import evaluate_biased_score
+from eval_clip_score_miil import evaluate_clip_score
+
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DPMSolverMultistepScheduler
@@ -62,6 +65,11 @@ from diffusers.optimization import get_scheduler
 from diffusers.training_utils import EMAModel
 from diffusers.utils import check_min_version, deprecate
 from diffusers.utils.import_utils import is_xformers_available
+from diffusers.models.attention_processor import (
+    LoRAAttnProcessor,
+)
+from diffusers.loaders import AttnProcsLayers
+
 
 import csv
 import time
@@ -69,10 +77,10 @@ import copy
 import json
 import glob
 
-from x0_dataset_gender import x0_dataset, collate_fn
-from x0_dataset_gender_laion import x0_dataset_laion
-
-#from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
+# from x0_dataset_gender import x0_dataset, collate_fn
+from x0_dataset_gender_multitmp import x0_dataset_multitmp, collate_fn
+from x0_dataset_gender_laion import x0_dataset_laion, collate_fn
+from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -177,6 +185,16 @@ def parse_args():
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
+        "--use_lora",
+        action="store_true",
+        help="use lora finetuning for unet",
+    )
+    parser.add_argument(
+        "--use_laion",
+        action="store_true",
+        help="use laion dataset for training",
+    )
+    parser.add_argument(
         "--revision",
         type=str,
         default=None,
@@ -213,29 +231,20 @@ def parse_args():
         default="240K",
     )
     parser.add_argument(
-        "--use_laion",
-        action="store_true",
-        help="use laion dataset for training",
-    )
-    parser.add_argument(
         "--use_linear_timestep",
         action="store_true",
         help="use linear timestep sampling",
     )
     parser.add_argument(
-        "--use_exp_timestep",
-        action="store_true",
-        help="use exp timestep sampling",
-    )
-    parser.add_argument(
-        "--use_timestep_900",
-        action="store_true",
-        help="use timestep 900 up",
-    )
-    parser.add_argument(
-        "--use_multi_templates",
+        "--use_test_templates",
         action="store_true",
         help="use multi template for training",
+    )
+    parser.add_argument(
+        "--num_templates",
+        type=int,
+        default=None,
+        help="number of templates for training",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -441,6 +450,7 @@ def parse_args():
     parser.add_argument("--lambda_sd", type=float, default=1.0, help="weighting for the denoising task loss")  
     parser.add_argument("--lambda_kd_output", type=float, default=1.0, help="weighting for output KD loss")  
     parser.add_argument("--lambda_kd_feat", type=float, default=1.0, help="weighting for feature KD loss")  
+    parser.add_argument("--lambda_reg", type=float, default=1e-2, help="Weight regularization: student vs teacher")
     parser.add_argument("--valid_steps", type=int, default=10000)
     parser.add_argument("--num_valid_images", type=int, default=2)
     parser.add_argument("--use_copy_weight_from_teacher", action="store_true", help="Whether to initialize unet student with teacher's weights",)
@@ -517,14 +527,9 @@ def parse_args():
     parser.add_argument('--clip_batch_size', type=int, default=50, help='Batch size for processing images')
 
     parser.add_argument("--use_sd_loss", action="store_true", help="Whether to calculate sd_loss (denoising task loss).")
-    
+    parser.add_argument("--use_reg_loss", action="store_true", help="Whether to calculate reg_loss (regularization loss).")
+
     ########################################################### evaluation parser ###########################################################
-    parser.add_argument(
-        "--attribute",
-        type=str,
-        default=None,
-        required=True
-    )
     parser.add_argument(
         "--load_text_encoder_lora_from",
         type=str,
@@ -603,6 +608,11 @@ def parse_args():
         type=str,
         default=None,
         help="provide the checkpoint path to resume from checkpoint",
+    )
+    parser.add_argument(
+        "--eval_csv_path",
+        type=str,
+        default="./data/bias_eval/bias_eval_gender.csv",
     )
     parser.add_argument(
         "--rank",
@@ -793,15 +803,45 @@ def main():
     # Copy weights from teacher to student
     if args.use_copy_weight_from_teacher:
         copy_weight_from_teacher(unet, unet_teacher, args.unet_config_name)
-   
 
     # Freeze student's vae and text_encoder and teacher's unet
     vae.requires_grad_(False)
     text_encoder.requires_grad_(False)
     unet_teacher.requires_grad_(False)
+    #unet.requires_grad_(False)
     vae.eval()
     text_encoder.eval()
-   
+    unet_teacher.eval()
+
+    if args.use_lora:
+        unet.requires_grad_(False)
+        
+    if args.use_lora:
+        print("Use LoRA Finetuning!!!")
+        unet_lora_procs = {}
+        for name in unet.attn_processors.keys():
+            cross_attention_dim = None if name.endswith("attn1.processor") else unet.config.cross_attention_dim
+            if name.startswith("mid_block"):
+                hidden_size = unet.config.block_out_channels[-1]
+            elif name.startswith("up_blocks"):
+                block_id = int(name[len("up_blocks.")])
+                hidden_size = list(reversed(unet.config.block_out_channels))[block_id]
+            elif name.startswith("down_blocks"):
+                block_id = int(name[len("down_blocks.")])
+                hidden_size = unet.config.block_out_channels[block_id]
+
+            unet_lora_procs[name] = LoRAAttnProcessor(
+                hidden_size=hidden_size,
+                cross_attention_dim=cross_attention_dim,
+                rank=args.rank,
+            ).to(accelerator.device)
+
+        unet.set_attn_processor(unet_lora_procs)
+        unet_lora_layers = AttnProcsLayers(unet.attn_processors)
+        for p in unet_lora_layers.parameters():
+            torch.distributed.broadcast(p, src=0)
+
+
     # Create EMA for the unet.
     if args.use_ema:
         ema_unet = UNet2DConditionModel.from_config(config_student, revision=args.revision)
@@ -927,13 +967,6 @@ def main():
                                 'up_blocks.0', 'up_blocks.1', 'up_blocks.2']  
 
 
-    if args.channel_mapping:
-        teacher_channels_list = get_layer_output_channels(unet_teacher, mapping_layers_tea)
-        student_channels_list = get_layer_output_channels(unet, mapping_layers_stu)
-        conv_layers = MultiConv1x1(student_channels_list, teacher_channels_list)
-        parameters = list(unet.parameters()) + list(conv_layers.parameters())
-    else:
-        parameters = unet.parameters()
 
     # print(f"Number of parameters in text_encoder: {count_parameters(text_encoder):,}")
     # print(f"Number of parameters in vae: {count_parameters(vae):,}")
@@ -943,9 +976,15 @@ def main():
     # with accelerator.main_process_first():
     #     for name, module in unet.named_modules():
     #         print(name)
-    num_parameters_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
-    print(f"Number of trainable parameters in unet (student): {num_parameters_unet:,}")
-    
+    if args.use_lora:
+        num_parameters_unet = sum(p.numel() for p in unet_lora_layers.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters in unet lora layers (student): {num_parameters_unet:,}")
+        parameters = unet_lora_layers.parameters()
+    else:
+        num_parameters_unet = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+        print(f"Number of trainable parameters in unet (student): {num_parameters_unet:,}")
+        parameters = unet.parameters()
+        
     optimizer = optimizer_cls(
         parameters,
         lr=args.learning_rate,
@@ -959,18 +998,14 @@ def main():
         train_dataset = x0_dataset_laion(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
                                 random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
                                 world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep)
+                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples)
         print("Use Laion for main training data!!")
-    else:
-        train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
+    else: 
+        train_dataset = x0_dataset_multitmp(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
                                 random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
                                 world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                num_train_x0=args.num_train_x0, use_multi_templates=args.use_multi_templates,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep, use_timestep_900=args.use_timestep_900)
-        print("Use occupation data for main training data!!")
-
+                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples)
+        print("Use Occupation for main training data!!")
 
     if args.max_train_samples is not None:
         original_seed = random.getstate()
@@ -1009,31 +1044,37 @@ def main():
     # add_hook(unet_teacher, acts_tea, mapping_layers_tea)
     # add_hook(unet, acts_stu, mapping_layers_stu)
 
-    if args.channel_mapping:
-        # Prepare everything with our `accelerator`.
-        unet, conv_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
-            unet, conv_layers, optimizer, train_dataloader, lr_scheduler
+    if args.use_lora:
+        unet_lora_layers, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+            unet_lora_layers, optimizer, train_dataloader, lr_scheduler
         )
-        if hasattr(conv_layers, 'module'):
-            conv_module = conv_layers.module
-        else:
-            conv_module = conv_layers
-        
     else:
         unet, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
             unet, optimizer, train_dataloader, lr_scheduler
         )
-        
-    
+
     if torch.cuda.device_count() > 1:
         print(f"use multi-gpu: # gpus {torch.cuda.device_count()}")
-        # revise the hooked feature names for student (to consider ddp wrapper)
-        for i, m_stu in enumerate(mapping_layers_stu):
-            mapping_layers_stu[i] = 'module.'+m_stu
-            print(mapping_layers_stu[i])
-
+        
+        # ⛔️ only modify mapping_layers_stu if unet is DDP wrapped
+        if not args.use_lora:
+            for i, m_stu in enumerate(mapping_layers_stu):
+                mapping_layers_stu[i] = 'module.'+m_stu
+                #print(mapping_layers_stu[i])
+        else:
+            for m_stu in mapping_layers_stu:
+                print("clear")
     add_hook(unet_teacher, acts_tea, mapping_layers_tea)
     add_hook(unet, acts_stu, mapping_layers_stu)
+    # if torch.cuda.device_count() > 1:
+    #     print(f"use multi-gpu: # gpus {torch.cuda.device_count()}")
+    #     # revise the hooked feature names for student (to consider ddp wrapper)
+    #     for i, m_stu in enumerate(mapping_layers_stu):
+    #         mapping_layers_stu[i] = 'module.'+m_stu
+    #         print(mapping_layers_stu[i])
+
+    # add_hook(unet_teacher, acts_tea, mapping_layers_tea)
+    # add_hook(unet, acts_stu, mapping_layers_stu)
 
     
     if args.use_ema:
@@ -1052,6 +1093,19 @@ def main():
     vae.to(accelerator.device, dtype=weight_dtype)
     unet_teacher.to(accelerator.device, dtype=weight_dtype)
 
+    if args.use_lora:
+        unet.to(accelerator.device, dtype=weight_dtype)
+
+        for name, p in unet_lora_layers.named_parameters():
+            p.data = p.data.to(torch.float32)
+
+    # print("##########################################################################")
+    # for name, param in unet_lora_layers.named_parameters():
+    #     if param.requires_grad:
+    #         print(f"dtype: {param.dtype}")
+    # print("##########################################################################")
+
+
     # We need to recalculate our total training steps as the size of the training dataloader may have changed.
     num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
     if overrode_max_train_steps:
@@ -1069,6 +1123,8 @@ def main():
         )
         
     # Train!
+    if args.use_reg_loss:
+        print("Use regularization loss!")
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -1119,8 +1175,7 @@ def main():
 
     # get wandb_tracker (if it exists)
     wandb_tracker = accelerator.get_tracker("wandb")
-    #male_cnt=0
-    #female_cnt=0
+
     for epoch in range(first_epoch, args.num_train_epochs):
 
         unet.train()
@@ -1129,6 +1184,7 @@ def main():
         train_loss_sd = 0.0
         train_loss_kd_output = 0.0
         train_loss_kd_feat = 0.0
+        train_loss_reg = 0.0
 
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
@@ -1138,11 +1194,6 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
-                # for i in batch["genders"]:
-                #     if i == "male":
-                #         male_cnt += 1
-                #     else:
-                #         female_cnt += 1
                 # Convert images to latent space
                 latents = batch["latents"].to(weight_dtype)
 
@@ -1216,7 +1267,7 @@ def main():
                 loss_kd_feat = sum(losses_kd_feat)
 
                 # Compute the final loss
-                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
+                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat 
                 # loss = args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
 
                 ################################################## loss calculation ####################################################################
@@ -1237,7 +1288,10 @@ def main():
                 # Backpropagate
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
+                    if args.use_lora:
+                        accelerator.clip_grad_norm_(unet_lora_layers.parameters(), args.max_grad_norm)
+                    else:
+                        accelerator.clip_grad_norm_(unet.parameters(), args.max_grad_norm)
                 optimizer.step()
                 lr_scheduler.step()
                 optimizer.zero_grad()
@@ -1271,6 +1325,7 @@ def main():
                 train_loss_sd = 0.0
                 train_loss_kd_output = 0.0
                 train_loss_kd_feat = 0.0
+                train_loss_reg = 0.0
 
                 torch.cuda.empty_cache()
                 if global_step % args.checkpointing_steps == 0:
@@ -1283,43 +1338,47 @@ def main():
                     accelerator.wait_for_everyone()
                     
                 if global_step % args.evaluation_step==0: 
-                    #print(f"male: {male_cnt}, female: {female_cnt}")
-                    #male_cnt = 0
-                    #female_cnt = 0
-                    with open(args.prompts_path, 'r') as f:
-                        experiment_data = json.load(f)
-                    for num in range(len(experiment_data["prompt_templates_test"])):     
-                        eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, i=num)
-                        accelerator.wait_for_everyone()
+                    eval_from_csv(
+                        args=args,
+                        accelerator=accelerator,
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        unet=unet,
+                        vae=vae,
+                        noise_scheduler=eval_noise_scheduler,
+                    )
+                    accelerator.wait_for_everyone()
                         
-                        if accelerator.is_main_process:
-                            # eval-generated-images.py 의 parse_args 함수 호출
-                            bias_mean, bias_var = evaluate_biased_score(args, accelerator, i=num, attribute=args.attribute)
-                            print(f"bias mean, var: {bias_mean}, {bias_var}")
-                        time.sleep(5)
-                        accelerator.wait_for_everyone()
-                        clip_mean, clip_var = evaluate_clip_score(args, accelerator, i=num)
-                        print(f"clip mean, var: {clip_mean}, {clip_var}")
+                    if accelerator.is_main_process:
+                        # eval-generated-images.py 의 parse_args 함수 호출
+                        bias_mean, bias_var = evaluate_biased_score(args, accelerator)
+                        print(f"bias mean, var: {bias_mean}, {bias_var}")
+                    time.sleep(5)
+                    accelerator.wait_for_everyone()
+                    clip_mean, clip_var = evaluate_clip_score(args, accelerator)
+                    print(f"clip mean, var: {clip_mean}, {clip_var}")
 
-                        if accelerator.is_main_process:
-                            with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
-                                f.write(f'Template: {experiment_data["prompt_templates_test"][num]}\nbias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
-                            wandb_tracker.log({
-                                f"bias_mean": float(bias_mean),
-                                f"bias_var": float(bias_var),
-                                f"clip_mean": float(clip_mean),
-                                f"clip_var": float(clip_var),
-                            }, step=global_step, sync=False)                        
-                        accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
+                            f.write(f'bias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
+                        # 🟢 wandb에 로깅 추가
+                        # wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
+                        wandb_tracker.log({
+                            f"bias_mean": float(bias_mean),
+                            f"bias_var": float(bias_var),
+                            f"clip_mean": float(clip_mean),
+                            f"clip_var": float(clip_var),
+                        }, step=global_step, sync=False)                    
+                    accelerator.wait_for_everyone()
 
-                        if accelerator.is_main_process:
-                            if os.path.exists(args.eval_save_dir):
-                                shutil.rmtree(args.eval_save_dir)
-                            if os.path.exists(args.eval_save_dir_256):
-                                shutil.rmtree(args.eval_save_dir_256)
-                            if os.path.exists(args.test_results_dir):
-                                shutil.rmtree(args.test_results_dir)
-                        accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        if os.path.exists(args.eval_save_dir):
+                            shutil.rmtree(args.eval_save_dir)
+                        if os.path.exists(args.eval_save_dir_256):
+                            shutil.rmtree(args.eval_save_dir_256)
+                        if os.path.exists(args.test_results_dir):
+                            shutil.rmtree(args.test_results_dir)
+                    accelerator.wait_for_everyone() 
                     
                 if global_step % args.valid_steps==0:      
                     eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, mode="eval_images")

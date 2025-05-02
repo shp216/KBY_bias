@@ -49,12 +49,14 @@ from packaging import version
 from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import CLIPTextModel, CLIPTokenizer
-from eval_clip_score_ddp import evaluate_clip_score, evaluate_clip_score_unseen_setting
 # from generate_ddp2 import sample_images_30k, sample_images_41k
 # from eval_score_wandb_log import log_eval_scores, log_eval_scores_unseen_setting
 from torchvision.utils import save_image, make_grid
-from eval_bias_image import eval_gender_images, generate_image
+from eval_bias_image import eval_gender_images
+from eval_bias_image_miil import eval_from_csv
 from eval_bias_score import evaluate_biased_score
+from eval_clip_score_miil import evaluate_clip_score
+
 
 import diffusers
 from diffusers import AutoencoderKL, DDPMScheduler, StableDiffusionPipeline, UNet2DConditionModel, DPMSolverMultistepScheduler
@@ -69,10 +71,9 @@ import copy
 import json
 import glob
 
-from x0_dataset_gender import x0_dataset, collate_fn
-from x0_dataset_gender_laion import x0_dataset_laion
-
-#from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
+# from x0_dataset_gender import x0_dataset, collate_fn
+from x0_dataset_gender_multitmp import x0_dataset_multitmp, collate_fn
+from funcs import MultiConv1x1, get_layer_output_channels, count_parameters
 
 import warnings
 warnings.filterwarnings("ignore")
@@ -213,29 +214,20 @@ def parse_args():
         default="240K",
     )
     parser.add_argument(
-        "--use_laion",
-        action="store_true",
-        help="use laion dataset for training",
-    )
-    parser.add_argument(
         "--use_linear_timestep",
         action="store_true",
         help="use linear timestep sampling",
     )
     parser.add_argument(
-        "--use_exp_timestep",
-        action="store_true",
-        help="use exp timestep sampling",
-    )
-    parser.add_argument(
-        "--use_timestep_900",
-        action="store_true",
-        help="use timestep 900 up",
-    )
-    parser.add_argument(
-        "--use_multi_templates",
+        "--use_test_templates",
         action="store_true",
         help="use multi template for training",
+    )
+    parser.add_argument(
+        "--num_templates",
+        type=int,
+        default=None,
+        help="number of templates for training",
     )
     parser.add_argument(
         "--max_train_samples",
@@ -441,6 +433,7 @@ def parse_args():
     parser.add_argument("--lambda_sd", type=float, default=1.0, help="weighting for the denoising task loss")  
     parser.add_argument("--lambda_kd_output", type=float, default=1.0, help="weighting for output KD loss")  
     parser.add_argument("--lambda_kd_feat", type=float, default=1.0, help="weighting for feature KD loss")  
+    parser.add_argument("--lambda_reg", type=float, default=1e-2, help="Weight regularization: student vs teacher")
     parser.add_argument("--valid_steps", type=int, default=10000)
     parser.add_argument("--num_valid_images", type=int, default=2)
     parser.add_argument("--use_copy_weight_from_teacher", action="store_true", help="Whether to initialize unet student with teacher's weights",)
@@ -517,14 +510,9 @@ def parse_args():
     parser.add_argument('--clip_batch_size', type=int, default=50, help='Batch size for processing images')
 
     parser.add_argument("--use_sd_loss", action="store_true", help="Whether to calculate sd_loss (denoising task loss).")
-    
+    parser.add_argument("--use_reg_loss", action="store_true", help="Whether to calculate reg_loss (regularization loss).")
+
     ########################################################### evaluation parser ###########################################################
-    parser.add_argument(
-        "--attribute",
-        type=str,
-        default=None,
-        required=True
-    )
     parser.add_argument(
         "--load_text_encoder_lora_from",
         type=str,
@@ -603,6 +591,11 @@ def parse_args():
         type=str,
         default=None,
         help="provide the checkpoint path to resume from checkpoint",
+    )
+    parser.add_argument(
+        "--eval_csv_path",
+        type=str,
+        default="./data/bias_eval/bias_eval_gender.csv",
     )
     parser.add_argument(
         "--rank",
@@ -955,22 +948,10 @@ def main():
     )
 
 ######################################################################## Bias Mitigation dataset Part ###################################################################################
-    if args.use_laion:
-        train_dataset = x0_dataset_laion(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
-                                random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
-                                world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep)
-        print("Use Laion for main training data!!")
-    else:
-        train_dataset = x0_dataset(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
-                                random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
-                                world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
-                                use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples,
-                                num_train_x0=args.num_train_x0, use_multi_templates=args.use_multi_templates,
-                                use_linear_timestep=args.use_linear_timestep, use_exp_timestep=args.use_exp_timestep, use_timestep_900=args.use_timestep_900)
-        print("Use occupation data for main training data!!")
-
+    train_dataset = x0_dataset_multitmp(data_dir=args.train_data_dir, extra_text_dir=args.extra_text_dir,n_T=noise_scheduler.num_train_timesteps, 
+                               random_conditioning=args.random_conditioning, random_conditioning_lambda=args.random_conditioning_lambda, 
+                               world_size=world_size, rank=local_rank, drop_text=args.drop_text, drop_text_p=args.drop_text_p, 
+                               use_unseen_setting=args.use_unseen_setting, gpt_caption = args.gpt_caption, max_extra_text_samples=args.max_extra_text_samples)
 
     if args.max_train_samples is not None:
         original_seed = random.getstate()
@@ -1069,6 +1050,8 @@ def main():
         )
         
     # Train!
+    if args.use_reg_loss:
+        print("Use regularization loss!")
     total_batch_size = args.train_batch_size * accelerator.num_processes * args.gradient_accumulation_steps
 
     logger.info("***** Running training *****")
@@ -1119,8 +1102,7 @@ def main():
 
     # get wandb_tracker (if it exists)
     wandb_tracker = accelerator.get_tracker("wandb")
-    #male_cnt=0
-    #female_cnt=0
+
     for epoch in range(first_epoch, args.num_train_epochs):
 
         unet.train()
@@ -1129,6 +1111,7 @@ def main():
         train_loss_sd = 0.0
         train_loss_kd_output = 0.0
         train_loss_kd_feat = 0.0
+        train_loss_reg = 0.0
 
         for step, batch in enumerate(train_dataloader):
             # Skip steps until we reach the resumed step
@@ -1138,11 +1121,6 @@ def main():
                 continue
 
             with accelerator.accumulate(unet):
-                # for i in batch["genders"]:
-                #     if i == "male":
-                #         male_cnt += 1
-                #     else:
-                #         female_cnt += 1
                 # Convert images to latent space
                 latents = batch["latents"].to(weight_dtype)
 
@@ -1215,8 +1193,35 @@ def main():
 
                 loss_kd_feat = sum(losses_kd_feat)
 
+                #Compute the Regularization loss
+                loss_reg = torch.tensor(0.0, device=accelerator.device)
+                if args.use_reg_loss:
+                    with torch.no_grad():
+                        teacher_params = dict(unet_teacher.named_parameters())
+
+                    for name, param in unet.named_parameters():
+                        if name in teacher_params and param.shape == teacher_params[name].shape:
+                            loss_reg += F.mse_loss(param.float(), teacher_params[name].float(), reduction='sum')
+
+                # #Compute the Regularization loss
+                # loss_reg = torch.tensor(0.0, device=accelerator.device)
+                # total_elements = 0
+                # if args.use_reg_loss:
+                #     with torch.no_grad():
+                #         teacher_params = dict(unet_teacher.named_parameters())
+
+                #     for name, param in unet.named_parameters():
+                #         if name in teacher_params and param.shape == teacher_params[name].shape:
+                #             diff = param - teacher_params[name]
+                #             loss_reg += torch.sum((diff.float()) ** 2)  # L2^2
+                #             total_elements += diff.numel()
+
+                #     if total_elements > 0:
+                #         loss_reg = loss_reg / total_elements  # 평균 L2 제곱 거리
+
+
                 # Compute the final loss
-                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
+                loss = args.lambda_sd * loss_sd + args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat + args.lambda_reg * loss_reg
                 # loss = args.lambda_kd_output * loss_kd_output + args.lambda_kd_feat * loss_kd_feat
 
                 ################################################## loss calculation ####################################################################
@@ -1233,6 +1238,10 @@ def main():
 
                 avg_loss_kd_feat = accelerator.gather(loss_kd_feat.repeat(args.train_batch_size)).mean()
                 train_loss_kd_feat += avg_loss_kd_feat.item() / args.gradient_accumulation_steps
+
+                avg_loss_reg = accelerator.gather(loss_reg.repeat(args.train_batch_size)).mean()
+                train_loss_reg += avg_loss_reg.item() / args.gradient_accumulation_steps
+
 
                 # Backpropagate
                 accelerator.backward(loss)
@@ -1254,6 +1263,7 @@ def main():
                         "train_loss_sd": train_loss_sd,
                         "train_loss_kd_output": train_loss_kd_output,
                         "train_loss_kd_feat": train_loss_kd_feat,
+                        "train_loss_reg": train_loss_reg,
                         "lr": lr_scheduler.get_last_lr()[0]
                     }, 
                     step=global_step
@@ -1271,6 +1281,7 @@ def main():
                 train_loss_sd = 0.0
                 train_loss_kd_output = 0.0
                 train_loss_kd_feat = 0.0
+                train_loss_reg = 0.0
 
                 torch.cuda.empty_cache()
                 if global_step % args.checkpointing_steps == 0:
@@ -1283,43 +1294,47 @@ def main():
                     accelerator.wait_for_everyone()
                     
                 if global_step % args.evaluation_step==0: 
-                    #print(f"male: {male_cnt}, female: {female_cnt}")
-                    #male_cnt = 0
-                    #female_cnt = 0
-                    with open(args.prompts_path, 'r') as f:
-                        experiment_data = json.load(f)
-                    for num in range(len(experiment_data["prompt_templates_test"])):     
-                        eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, i=num)
-                        accelerator.wait_for_everyone()
+                    eval_from_csv(
+                        args=args,
+                        accelerator=accelerator,
+                        tokenizer=tokenizer,
+                        text_encoder=text_encoder,
+                        unet=unet,
+                        vae=vae,
+                        noise_scheduler=eval_noise_scheduler,
+                    )
+                    accelerator.wait_for_everyone()
                         
-                        if accelerator.is_main_process:
-                            # eval-generated-images.py 의 parse_args 함수 호출
-                            bias_mean, bias_var = evaluate_biased_score(args, accelerator, i=num, attribute=args.attribute)
-                            print(f"bias mean, var: {bias_mean}, {bias_var}")
-                        time.sleep(5)
-                        accelerator.wait_for_everyone()
-                        clip_mean, clip_var = evaluate_clip_score(args, accelerator, i=num)
-                        print(f"clip mean, var: {clip_mean}, {clip_var}")
+                    if accelerator.is_main_process:
+                        # eval-generated-images.py 의 parse_args 함수 호출
+                        bias_mean, bias_var = evaluate_biased_score(args, accelerator)
+                        print(f"bias mean, var: {bias_mean}, {bias_var}")
+                    time.sleep(5)
+                    accelerator.wait_for_everyone()
+                    clip_mean, clip_var = evaluate_clip_score(args, accelerator)
+                    print(f"clip mean, var: {clip_mean}, {clip_var}")
 
-                        if accelerator.is_main_process:
-                            with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
-                                f.write(f'Template: {experiment_data["prompt_templates_test"][num]}\nbias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
-                            wandb_tracker.log({
-                                f"bias_mean": float(bias_mean),
-                                f"bias_var": float(bias_var),
-                                f"clip_mean": float(clip_mean),
-                                f"clip_var": float(clip_var),
-                            }, step=global_step, sync=False)                        
-                        accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        with open(os.path.join(args.eval_score_logdir, f"eval_{global_step}.txt"), "a") as f:
+                            f.write(f'bias_mean: {bias_mean}\nbias_var: {bias_var}\nclip_mean: {clip_mean}\nclip_var: {clip_var}\n\n')
+                        # 🟢 wandb에 로깅 추가
+                        # wandb_tracker = accelerator.get_tracker("wandb", unwrap=True)
+                        wandb_tracker.log({
+                            f"bias_mean": float(bias_mean),
+                            f"bias_var": float(bias_var),
+                            f"clip_mean": float(clip_mean),
+                            f"clip_var": float(clip_var),
+                        }, step=global_step, sync=False)                    
+                    accelerator.wait_for_everyone()
 
-                        if accelerator.is_main_process:
-                            if os.path.exists(args.eval_save_dir):
-                                shutil.rmtree(args.eval_save_dir)
-                            if os.path.exists(args.eval_save_dir_256):
-                                shutil.rmtree(args.eval_save_dir_256)
-                            if os.path.exists(args.test_results_dir):
-                                shutil.rmtree(args.test_results_dir)
-                        accelerator.wait_for_everyone()
+                    if accelerator.is_main_process:
+                        if os.path.exists(args.eval_save_dir):
+                            shutil.rmtree(args.eval_save_dir)
+                        if os.path.exists(args.eval_save_dir_256):
+                            shutil.rmtree(args.eval_save_dir_256)
+                        if os.path.exists(args.test_results_dir):
+                            shutil.rmtree(args.test_results_dir)
+                    accelerator.wait_for_everyone() 
                     
                 if global_step % args.valid_steps==0:      
                     eval_gender_images(args, accelerator, tokenizer, text_encoder, unet, vae, eval_noise_scheduler, mode="eval_images")
@@ -1344,6 +1359,7 @@ def main():
                     "sd_loss": loss_sd.detach().item(),
                     "kd_output_loss": loss_kd_output.detach().item(),
                     "kd_feat_loss": loss_kd_feat.detach().item(),
+                    "reg_loss": loss_reg.detach().item(),
                     "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
             accelerator.wait_for_everyone()

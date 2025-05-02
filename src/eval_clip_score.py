@@ -20,35 +20,76 @@ def parse_args():
     return args
 
 if __name__ == "__main__":
-    args = parse_args()
-    
-    model, _, preprocess = open_clip.create_model_and_transforms('ViT-g-14',
-                                                                 pretrained='laion2b_s34b_b88k',
-                                                                 device=args.device)
-    tokenizer = open_clip.get_tokenizer('ViT-g-14')
 
-    file_list = get_file_list_from_csv(args.data_list)
-    score_arr = []
-    for i, file_info in enumerate(file_list):
-        img_path = os.path.join(args.img_dir, file_info[0])
-        val_prompt = file_info[1]           
-        text = tokenizer([val_prompt]).to(args.device)
+ 
+    image_dir = "/home/work/kby_bias/KBY_bias/results/CEO_test/outputs/test_images/both_ceo_image"
+    prompt = "A photo of the CEO"
+    device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
-        image = preprocess(Image.open(img_path)).unsqueeze(0).to(args.device)
-        with torch.no_grad():
-            image_features = model.encode_image(image)
-            text_features = model.encode_text(text)
-        image_features /= image_features.norm(dim=-1, keepdim=True)
+    # Load model and preprocessing
+    model, _, preprocess = open_clip.create_model_and_transforms('ViT-bigG-14',
+                                                                pretrained='laion2b_s39b_b160k',
+                                                                device=device)
+    tokenizer = open_clip.get_tokenizer('ViT-bigG-14')
+
+    # Prepare text embedding
+    text = tokenizer([prompt]).to(device)
+    with torch.no_grad():
+        text_features = model.encode_text(text)
         text_features /= text_features.norm(dim=-1, keepdim=True)
 
-        probs = (text_features.cpu().numpy() @ image_features.cpu().numpy().T)
-        score_arr.append(probs[0][0])
+    # Loop through all images
+    image_files = sorted([f for f in os.listdir(image_dir) if f.endswith(('.png', '.jpg', '.jpeg'))])
+    score_arr = []
 
-        if i % 1000 == 0:
-            print(f"{i}/{len(file_list)} | {val_prompt} | probs {probs[0][0]}") 
-    
+    for i, img_file in enumerate(image_files):
+        img_path = os.path.join(image_dir, img_file)
+        image = preprocess(Image.open(img_path)).unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            image_features = model.encode_image(image)
+            image_features /= image_features.norm(dim=-1, keepdim=True)
+
+        probs = (text_features @ image_features.T).squeeze().item()
+        score_arr.append(probs)
+
+        if i % 10 == 0:
+            print(f"{i}/{len(image_files)} | {img_file} | score: {probs:.4f}")
+
+    # Final score
     final_score = sum(score_arr) / len(score_arr)
-    with open(args.save_txt, 'w') as f:
-        f.write(f"FINAL clip score {final_score}\n")
-        f.write(f"-- sum score {sum(score_arr)}\n")
-        f.write(f"-- len {len(score_arr)}\n")
+    print(f"\n✅ Final CLIP score: {final_score:.4f}")
+
+    # args = parse_args()
+    
+    # model, _, preprocess = open_clip.create_model_and_transforms('ViT-bigG-14',
+    #                                                              pretrained='laion2b_s39b_b160k',
+    #                                                              device=device)
+    # tokenizer = open_clip.get_tokenizer('ViT-bigG-14')
+    # file_list = get_file_list_from_csv(args.data_list)
+    # score_arr = []
+    # for i, file_info in enumerate(file_list):
+    #     img_path = os.path.join(args.img_dir, file_info[0])
+    #     val_prompt = file_info[1]           
+    #     text = tokenizer([val_prompt]).to(args.device)
+
+    #     image = preprocess(Image.open(img_path)).unsqueeze(0).to(args.device)
+    #     with torch.no_grad():
+    #         image_features = model.encode_image(image)
+    #         text_features = model.encode_text(text)
+    #     image_features /= image_features.norm(dim=-1, keepdim=True)
+    #     text_features /= text_features.norm(dim=-1, keepdim=True)
+
+    #     probs = (text_features.cpu().numpy() @ image_features.cpu().numpy().T)
+    #     score_arr.append(probs[0][0])
+
+    #     if i % 1000 == 0:
+    #         print(f"{i}/{len(file_list)} | {val_prompt} | probs {probs[0][0]}") 
+    
+    # final_score = sum(score_arr) / len(score_arr)
+    # print("final_score: ", final_score)     
+
+    # with open(args.save_txt, 'w') as f:
+    #     f.write(f"FINAL clip score {final_score}\n")
+    #     f.write(f"-- sum score {sum(score_arr)}\n")
+    #     f.write(f"-- len {len(score_arr)}\n")

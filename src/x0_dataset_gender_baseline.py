@@ -8,7 +8,7 @@ import random
 import numpy as np
 import json
 
-class x0_dataset(Dataset):
+class x0_dataset_baseline(Dataset):
     def __init__(self, data_dir, extra_text_dir=None, n_T=1000, random_conditioning = False, 
                  random_conditioning_lambda=5, world_size=1, rank=0, drop_text=True, drop_text_p=0.1, 
                  use_unseen_setting=False, gpt_caption=False, max_extra_text_samples=None, safe_tensor=None, num_train_x0="240K",
@@ -45,15 +45,11 @@ class x0_dataset(Dataset):
             metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_2k.csv") #occupation 24k dataset
         elif self.num_train_x0 == "200":
             metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_200.csv") #occupation 24k dataset
-        elif self.num_train_x0 == "4":
-            metadata_path = os.path.join(data_dir, "x0_occupation_gender_miil_4.csv") #occupation 24k dataset
         else:
             raise ValueError(f"Invalid num_train_x0 value: {self.num_train_x0}. Expected one of ['8K', '4K', '2K', '200']")
 
         print(f"Using data dir in {metadata_path}!!!!!")
         self.metadata = pd.read_csv(metadata_path)
-        if self.random_conditioning:
-            print("Use occupation random conditioning!!!")
         
         self.text_data = []
         
@@ -75,28 +71,6 @@ class x0_dataset(Dataset):
         prompt_template_teacher = self.occupation_json["prompt_templates_train_teacher"][0]  # 템플릿 불러오기
         prompt_template_student = self.occupation_json["prompt_templates_train_student"][0]  # 템플릿 불러오기
 
-        # if self.num_train_x0 == "4":
-        #     # 1) 원본 file_name의 latent 로드
-        #     latent_path1 = os.path.join(self.data_dir, file_name.replace('.png', '_latent.pt'))
-        #     latent1 = torch.load(latent_path1, map_location='cpu')
-
-        #     # 2) 처음 4개 행에서 같은 gender를 가진 다른 파일 이름만 추출
-        #     first_four = self.metadata.iloc[:4]
-        #     same_gender_idxs = first_four.index[first_four['gender'] == gender].tolist()
-        #     same_gender_idxs = [i for i in same_gender_idxs if first_four.iloc[i]['file_name'] != file_name]
-
-        #     # 3) 나머지 중 하나를 랜덤 선택
-        #     other_idx = random.choice(same_gender_idxs)
-
-        #     # 4) 선택된 다른 샘플의 latent 로드
-        #     other_file = first_four.iloc[other_idx]['file_name']
-        #     latent_path2 = os.path.join(self.data_dir, other_file.replace('.png', '_latent.pt'))
-        #     latent2 = torch.load(latent_path2, map_location='cpu')
-
-        #     # 5) 0~1 사이를 균일분포로 뽑아 블렌딩
-        #     alpha = torch.rand(1)
-        #     latent_tensor = alpha * latent1 + (1 - alpha) * latent2
-        # else:
         if self.safe_tensor:
             latent_file_name = file_name.replace('.png', '_latent.safetensors')
             latent_path = os.path.join(self.data_dir, latent_file_name)

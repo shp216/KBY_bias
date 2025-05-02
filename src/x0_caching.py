@@ -62,7 +62,7 @@ def main():
     occupations = data["occupations_train_set"]
     
     # Define save directory for generated images
-    save_dir = "./data/x0_occupation"
+    save_dir = "./x0_occupation"
     os.makedirs(save_dir, exist_ok=True)
 
     # Initialize dataset and dataloader

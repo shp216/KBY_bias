@@ -7,6 +7,10 @@ data
 wandb
 *__pycache__*
 results
+results_240
+results_gender
+results_neurips
+results_T1_0424
 mlruns
 .nfs*
 score
@@ -15,3 +19,4 @@ Appendix_qualitative_results
 diffusion_db_qual.zip
 src/eff_eval*
 eval_data
+cache

@@ -33,7 +33,7 @@ import glob
 from insightface.app import FaceAnalysis
 import torchvision
 from torchvision import transforms
-#import face_recognition
+import face_recognition
 import json
 import wandb
 
@@ -61,7 +61,7 @@ def load_pkl(file_path):
     return face_indicators_all, gender_logits_all, prompt_texts_all
 
 
-def calculate_bias_for_prompt_gender(face_indicators, gender_logits):
+def calculate_bias_for_prompt(face_indicators, gender_logits):
     # 클래스 라벨 정의 (K = 2)
     GENDER_CLASSES = {0: "Female", 1: "Male"}
     K = len(GENDER_CLASSES)
@@ -108,16 +108,15 @@ def calculate_bias_for_prompt_gender(face_indicators, gender_logits):
     return bias_score
 
 
-def calculate_bias_for_all_prompts_gender(face_indicators_all, gender_logits_all, prompt_texts_all):
+def calculate_bias_for_all_prompts(face_indicators_all, gender_logits_all, prompt_texts_all):
     prompt_bias_scores = []
 
     for prompt_idx, face_indicators in face_indicators_all.items():
-        print("prompt_idx: ", prompt_idx)
         gender_logits = gender_logits_all[prompt_idx]
         prompt_text = prompt_texts_all[prompt_idx]
         
         # 프롬프트 별 편향 점수 계산
-        bias_score = calculate_bias_for_prompt_gender(face_indicators, gender_logits)
+        bias_score = calculate_bias_for_prompt(face_indicators, gender_logits)
 
         if bias_score is not None:
             prompt_bias_scores.append({
@@ -126,116 +125,6 @@ def calculate_bias_for_all_prompts_gender(face_indicators_all, gender_logits_all
             })
 
     return prompt_bias_scores
-
-def calculate_bias_for_prompt_race(face_indicators, race_logits):
-    RACE_CLASSES = {0: "White", 1: "Black", 2: "Indian", 3: "Asian"}
-    K = len(RACE_CLASSES)
-    freq_dict = {i: 0 for i in range(K)}
-
-    detected_indices = (face_indicators == 1).nonzero(as_tuple=False).view(-1)
-    if len(detected_indices) == 0:
-        return None
-
-    race_probs = torch.softmax(race_logits[detected_indices], dim=-1)
-    race_preds = race_probs.argmax(dim=-1).tolist()
-
-    for pred in race_preds:
-        freq_dict[pred] += 1
-
-    freqs = np.array([freq_dict[i] for i in range(K)])
-    total_images = freqs.sum()
-    if total_images == 0:
-        return None
-    freqs = freqs / total_images
-
-    bias_score = 0
-    for i in range(K):
-        for j in range(i + 1, K):
-            bias_score += abs(freqs[i] - freqs[j])
-    num_pairs = K * (K - 1) / 2
-    bias_score /= num_pairs
-
-    return bias_score
-
-def calculate_bias_for_all_prompts_race(face_indicators_all, race_logits_all, prompt_texts_all):
-    prompt_bias_scores = []
-
-    for prompt_idx, face_indicators in face_indicators_all.items():
-        print("prompt_idx: ", prompt_idx)
-        race_logits = race_logits_all[prompt_idx]
-        prompt_text = prompt_texts_all[prompt_idx]
-
-        bias_score = calculate_bias_for_prompt_race(face_indicators, race_logits)
-
-        if bias_score is not None:
-            prompt_bias_scores.append({
-                "prompt": prompt_text,
-                "bias_score": bias_score
-            })
-
-    return prompt_bias_scores
-
-def calculate_bias_for_prompt_gender_race(face_indicators, gender_logits, race_logits):
-    GENDER_CLASSES = {0: "Female", 1: "Male"}
-    RACE_CLASSES = {0: "White", 1: "Black", 2: "Indian", 3: "Asian"}
-    K = len(GENDER_CLASSES) * len(RACE_CLASSES)  # = 8
-
-    freq_dict = {i: 0 for i in range(K)}
-    detected_indices = (face_indicators == 1).nonzero(as_tuple=False).view(-1)
-
-    if len(detected_indices) == 0:
-        return None
-
-    gender_probs = torch.softmax(gender_logits[detected_indices], dim=-1)
-    race_probs = torch.softmax(race_logits[detected_indices], dim=-1)
-
-    gender_preds = gender_probs.argmax(dim=-1)
-    race_preds = race_probs.argmax(dim=-1)
-
-    # class_id = gender * 4 + race
-    class_ids = (gender_preds * 4 + race_preds).tolist()
-
-    for cid in class_ids:
-        freq_dict[cid] += 1
-
-    freqs = np.array([freq_dict[i] for i in range(K)])
-    total_images = freqs.sum()
-    if total_images == 0:
-        return None
-
-    freqs = freqs / total_images
-
-    bias_score = 0
-    for i in range(K):
-        for j in range(i + 1, K):
-            bias_score += abs(freqs[i] - freqs[j])
-    num_pairs = K * (K - 1) / 2
-    bias_score /= num_pairs
-
-    return bias_score
-
-def calculate_bias_for_all_prompts_gender_race(
-    face_indicators_all, gender_logits_all, race_logits_all, prompt_texts_all
-):
-    prompt_bias_scores = []
-
-    for prompt_idx, face_indicators in face_indicators_all.items():
-        gender_logits = gender_logits_all[prompt_idx]
-        race_logits = race_logits_all[prompt_idx]
-        prompt_text = prompt_texts_all[prompt_idx]
-
-        bias_score = calculate_bias_for_prompt_gender_race(
-            face_indicators, gender_logits, race_logits
-        )
-
-        if bias_score is not None:
-            prompt_bias_scores.append({
-                "prompt": prompt_text,
-                "bias_score": bias_score
-            })
-
-    return prompt_bias_scores
-
 
 
 def image_grid(imgs, rows, cols):
@@ -691,8 +580,7 @@ def get_largest_face_FR(faces_from_FR, dim_max, dim_min):
         return faces_from_FR[idx_max]
 
 
-def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None, i=None, attribute=None):
-    import face_recognition
+def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None, i=None):
 
     #args.device = f"cuda:{args.gpu_id}"
     device = accelerator.device
@@ -703,19 +591,13 @@ def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None
     if mode == "eval_images":
         test_prompts = experiment_data["val_prompts"]  # Test 프롬프트 리스트
     else:
-        # df = pd.read_csv(args.eval_csv_path)
-        # test_prompts = df["prompt"].tolist()
-
+        #test_prompts = experiment_data["test_prompts"]  # Test 프롬프트 리스트
         template = experiment_data["prompt_templates_test"][i]
         test_prompts = [template.format(occupation=occ) for occ in experiment_data["occupations_test_set"]]
-        # template = experiment_data["prompt_templates_test"][i]
-        # test_prompts = [template.format(occupation=occ) for occ in experiment_data["occupations_test_set"]]
-        #test_prompts = experiment_data["test_prompts"]  # Test 프롬프트 리스트
 
     
     face_app = FaceAnalysis(
         name="buffalo_l",
-        root="data",
         allowed_modules=['detection'], 
         providers=['CUDAExecutionProvider'], 
         provider_options=[{'device_id': device}]
@@ -758,7 +640,7 @@ def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None
     gender_logits_all = {}
     race_logits_all = {}
     age_logits_all = {}
-    prompt_texts_all = experiment_data["occupations_test_set"]  # 프롬프트 텍스트 저장
+    prompt_texts_all = {}  # 프롬프트 텍스트 저장
 
     for prompt_folder in prompt_folders:
         prompt_idx = int(prompt_folder.split("_")[-1])
@@ -769,7 +651,7 @@ def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None
         else:
             prompt_text = "Unknown Prompt"  # 인덱스가 범위를 벗어난 경우
 
-        #prompt_texts_all[prompt_idx] = experiment_data[]  # 프롬프트 저장
+        prompt_texts_all[prompt_idx] = prompt_text  # 프롬프트 저장
 
         imgs_p = []
         face_indicators_p = []
@@ -903,13 +785,7 @@ def evaluate_biased_score(args, accelerator, mode="eval_score", global_step=None
             pkl.dump(results, f)
 
         # 모든 프롬프트에 대해 편향 점수 계산
-        if attribute == "gender":
-            prompt_bias_scores = calculate_bias_for_all_prompts_gender(face_indicators_all, gender_logits_all, prompt_texts_all)
-        elif attribute == "race":
-            prompt_bias_scores = calculate_bias_for_all_prompts_race(face_indicators_all, race_logits_all, prompt_texts_all)
-        else:
-            prompt_bias_scores = calculate_bias_for_all_prompts_gender_race(face_indicators_all, gender_logits_all, race_logits_all, prompt_texts_all)
-
+        prompt_bias_scores = calculate_bias_for_all_prompts(face_indicators_all, gender_logits_all, prompt_texts_all)
 
         # DataFrame으로 변환
         df = pd.DataFrame(prompt_bias_scores)
@@ -1014,276 +890,276 @@ python eval-generated-images.py \
 
 
 
-# def evaluate_biased_score_ddp(args, accelerator, mode="eval_score"):
+def evaluate_biased_score_ddp(args, accelerator, mode="eval_score"):
 
-#     #args.device = f"cuda:{args.gpu_id}"
-#     device = accelerator.device
+    #args.device = f"cuda:{args.gpu_id}"
+    device = accelerator.device
     
-#     with open(args.prompts_path, 'r') as f:
-#         experiment_data = json.load(f)
+    with open(args.prompts_path, 'r') as f:
+        experiment_data = json.load(f)
         
-#     if mode == "eval_images":
-#         test_prompts = experiment_data["val_prompts"]  # Test 프롬프트 리스트
-#     else:
-#         test_prompts = experiment_data["test_prompts"]  # Test 프롬프트 리스트
+    if mode == "eval_images":
+        test_prompts = experiment_data["val_prompts"]  # Test 프롬프트 리스트
+    else:
+        test_prompts = experiment_data["test_prompts"]  # Test 프롬프트 리스트
 
     
-#     face_app = FaceAnalysis(
-#         name="buffalo_l",
-#         allowed_modules=['detection'], 
-#         providers=['CUDAExecutionProvider'], 
-#         provider_options=[{'device_id': device}]
-#         )
-#     face_app.prepare(ctx_id=0, det_size=(640, 640))
+    face_app = FaceAnalysis(
+        name="buffalo_l",
+        allowed_modules=['detection'], 
+        providers=['CUDAExecutionProvider'], 
+        provider_options=[{'device_id': device}]
+        )
+    face_app.prepare(ctx_id=0, det_size=(640, 640))
    
 
-#     gender_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
-#     gender_classifier._modules['classifier'][3] = nn.Linear(1280, 2, bias=True)
-#     gender_classifier.load_state_dict(torch.load(args.gender_classifier_weight))
-#     gender_classifier.to(device)
-#     gender_classifier.requires_grad_(False)
-#     gender_classifier.eval()
+    gender_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
+    gender_classifier._modules['classifier'][3] = nn.Linear(1280, 2, bias=True)
+    gender_classifier.load_state_dict(torch.load(args.gender_classifier_weight))
+    gender_classifier.to(device)
+    gender_classifier.requires_grad_(False)
+    gender_classifier.eval()
 
-#     race_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
-#     race_classifier._modules['classifier'][3] = nn.Linear(1280, 4, bias=True)
-#     race_classifier.load_state_dict(torch.load(args.race_classifier_weight))
-#     race_classifier.to(device)
-#     race_classifier.requires_grad_(False)
-#     race_classifier.eval()
+    race_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
+    race_classifier._modules['classifier'][3] = nn.Linear(1280, 4, bias=True)
+    race_classifier.load_state_dict(torch.load(args.race_classifier_weight))
+    race_classifier.to(device)
+    race_classifier.requires_grad_(False)
+    race_classifier.eval()
 
-#     age_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
-#     age_classifier._modules['classifier'][3] = nn.Linear(1280, 2, bias=True)
-#     age_classifier.load_state_dict(torch.load(args.age_classifier_weight))
-#     age_classifier.to(device)
-#     age_classifier.requires_grad_(False)
-#     age_classifier.eval()
+    age_classifier = mobilenet_v3_large(weights=MobileNet_V3_Large_Weights.DEFAULT, width_mult=1.0, reduced_tail=False, dilated=False)
+    age_classifier._modules['classifier'][3] = nn.Linear(1280, 2, bias=True)
+    age_classifier.load_state_dict(torch.load(args.age_classifier_weight))
+    age_classifier.to(device)
+    age_classifier.requires_grad_(False)
+    age_classifier.eval()
 
-#     prompt_folders = sorted(
-#         glob.glob(os.path.join(args.eval_save_dir, "prompt_*")), 
-#         key=lambda x: int(x.split("_")[-1])
-#         )
-#     # ✅ NEW: rank별로 prompt 나누기
-#     world_size = accelerator.num_processes
-#     rank = accelerator.process_index
-#     split_indices = torch.tensor_split(torch.arange(len(prompt_folders)), world_size)
-#     local_indices = split_indices[rank]
+    prompt_folders = sorted(
+        glob.glob(os.path.join(args.eval_save_dir, "prompt_*")), 
+        key=lambda x: int(x.split("_")[-1])
+        )
+    # ✅ NEW: rank별로 prompt 나누기
+    world_size = accelerator.num_processes
+    rank = accelerator.process_index
+    split_indices = torch.tensor_split(torch.arange(len(prompt_folders)), world_size)
+    local_indices = split_indices[rank]
 
-#     os.makedirs(args.test_results_dir, exist_ok=True)
+    os.makedirs(args.test_results_dir, exist_ok=True)
     
-#     face_indicators_all = {}
-#     face_bboxs_all = {}
-#     face_chips_all = {}
-#     aligned_face_chips_all = {}
-#     gender_logits_all = {}
-#     race_logits_all = {}
-#     age_logits_all = {}
-#     prompt_texts_all = {}  # 프롬프트 텍스트 저장
+    face_indicators_all = {}
+    face_bboxs_all = {}
+    face_chips_all = {}
+    aligned_face_chips_all = {}
+    gender_logits_all = {}
+    race_logits_all = {}
+    age_logits_all = {}
+    prompt_texts_all = {}  # 프롬프트 텍스트 저장
 
-#     for i in local_indices:
-#         prompt_idx = i.item()
-#         prompt_folder = prompt_folders[prompt_idx]
+    for i in local_indices:
+        prompt_idx = i.item()
+        prompt_folder = prompt_folders[prompt_idx]
         
-#         # prompt_idx에 따라 prompt 텍스트 저장
-#         if prompt_idx < len(test_prompts):
-#             prompt_text = test_prompts[prompt_idx]
-#         else:
-#             prompt_text = "Unknown Prompt"  # 인덱스가 범위를 벗어난 경우
+        # prompt_idx에 따라 prompt 텍스트 저장
+        if prompt_idx < len(test_prompts):
+            prompt_text = test_prompts[prompt_idx]
+        else:
+            prompt_text = "Unknown Prompt"  # 인덱스가 범위를 벗어난 경우
 
-#         prompt_texts_all[prompt_idx] = prompt_text  # 프롬프트 저장
+        prompt_texts_all[prompt_idx] = prompt_text  # 프롬프트 저장
 
-#         imgs_p = []
-#         face_indicators_p = []
-#         face_bboxs_p = []
-#         face_chips_p = []
-#         aligned_face_chips_p = []
-#         gender_logits_p = []
-#         race_logits_p = []
-#         age_logits_p = []
+        imgs_p = []
+        face_indicators_p = []
+        face_bboxs_p = []
+        face_chips_p = []
+        aligned_face_chips_p = []
+        gender_logits_p = []
+        race_logits_p = []
+        age_logits_p = []
 
-#         img_paths = sorted(
-#             glob.glob(os.path.join(prompt_folder, "img_*.jpg")),
-#             key=lambda x: int(x.split("_")[-1].split(".")[0])
-#             )
+        img_paths = sorted(
+            glob.glob(os.path.join(prompt_folder, "img_*.jpg")),
+            key=lambda x: int(x.split("_")[-1].split(".")[0])
+            )
 
-#         for img_path in tqdm(img_paths):
-#             img = torchvision.io.read_image(img_path)
-#             img = img.float().unsqueeze(dim=0)/255*2-1
+        for img_path in tqdm(img_paths):
+            img = torchvision.io.read_image(img_path)
+            img = img.float().unsqueeze(dim=0)/255*2-1
             
-#             face_indicator, face_bbox, face_chip, face_landmark, aligned_face_chip = get_face(img, face_app, face_recognition, args.size_face, args.size_aligned_face)
+            face_indicator, face_bbox, face_chip, face_landmark, aligned_face_chip = get_face(img, face_app, face_recognition, args.size_face, args.size_aligned_face)
             
-#             face_chip = face_chip.to(device)
+            face_chip = face_chip.to(device)
             
-#             gender_logit = gender_classifier(face_chip)
-#             race_logit = race_classifier(face_chip)
-#             age_logit = age_classifier(face_chip)
+            gender_logit = gender_classifier(face_chip)
+            race_logit = race_classifier(face_chip)
+            age_logit = age_classifier(face_chip)
             
-#             imgs_p.append(img)
-#             face_indicators_p.append( face_indicator )
-#             face_bboxs_p.append( face_bbox )
-#             face_chips_p.append( face_chip )
-#             aligned_face_chips_p.append( aligned_face_chip )
-#             gender_logits_p.append( gender_logit )
-#             race_logits_p.append( race_logit )
-#             age_logits_p.append( age_logit )
+            imgs_p.append(img)
+            face_indicators_p.append( face_indicator )
+            face_bboxs_p.append( face_bbox )
+            face_chips_p.append( face_chip )
+            aligned_face_chips_p.append( aligned_face_chip )
+            gender_logits_p.append( gender_logit )
+            race_logits_p.append( race_logit )
+            age_logits_p.append( age_logit )
 
-#         imgs_p = torch.cat( imgs_p )
-#         face_indicators_p = torch.cat( face_indicators_p )
-#         face_bboxs_p = torch.cat( face_bboxs_p )
-#         face_chips_p = torch.cat( face_chips_p )
-#         aligned_face_chips_p = torch.cat( aligned_face_chips_p )
-#         gender_logits_p = torch.cat( gender_logits_p )
-#         race_logits_p = torch.cat( race_logits_p )
-#         age_logits_p = torch.cat( age_logits_p )
+        imgs_p = torch.cat( imgs_p )
+        face_indicators_p = torch.cat( face_indicators_p )
+        face_bboxs_p = torch.cat( face_bboxs_p )
+        face_chips_p = torch.cat( face_chips_p )
+        aligned_face_chips_p = torch.cat( aligned_face_chips_p )
+        gender_logits_p = torch.cat( gender_logits_p )
+        race_logits_p = torch.cat( race_logits_p )
+        age_logits_p = torch.cat( age_logits_p )
 
-#         gender_probs_p = torch.softmax(gender_logits_p, dim=-1)
-#         race_probs_p = torch.softmax(race_logits_p, dim=-1)
-#         age_probs_p = torch.softmax(age_logits_p, dim=-1)
-#         gender_preds_p = gender_probs_p.max(dim=-1).indices
-#         race_preds_p = race_probs_p.max(dim=-1).indices
-#         age_preds_p = age_probs_p.max(dim=-1).indices
+        gender_probs_p = torch.softmax(gender_logits_p, dim=-1)
+        race_probs_p = torch.softmax(race_logits_p, dim=-1)
+        age_probs_p = torch.softmax(age_logits_p, dim=-1)
+        gender_preds_p = gender_probs_p.max(dim=-1).indices
+        race_preds_p = race_probs_p.max(dim=-1).indices
+        age_preds_p = age_probs_p.max(dim=-1).indices
 
-#         save_to = os.path.join(args.test_results_dir, f"prompt_{prompt_idx}.jpg")
-#         if mode == "eval_images":
-#             plot_in_grid_gender_race(
-#                 imgs_p, 
-#                 save_to, 
-#                 face_indicators=face_indicators_p, 
-#                 face_bboxs=face_bboxs_p, 
-#                 preds_gender=gender_preds_p, 
-#                 pred_class_probs_gender=gender_probs_p.max(dim=-1).values,
-#                 preds_race=race_preds_p, 
-#                 pred_class_probs_race=race_probs_p.max(dim=-1).values,
-#                 mode=mode
-#             )
+        save_to = os.path.join(args.test_results_dir, f"prompt_{prompt_idx}.jpg")
+        if mode == "eval_images":
+            plot_in_grid_gender_race(
+                imgs_p, 
+                save_to, 
+                face_indicators=face_indicators_p, 
+                face_bboxs=face_bboxs_p, 
+                preds_gender=gender_preds_p, 
+                pred_class_probs_gender=gender_probs_p.max(dim=-1).values,
+                preds_race=race_preds_p, 
+                pred_class_probs_race=race_probs_p.max(dim=-1).values,
+                mode=mode
+            )
             
         
-#         # plot_in_grid_gender_race_age(
-#         #     imgs_p, 
-#         #     save_to, 
-#         #     face_indicators=face_indicators_p, 
-#         #     face_bboxs=face_bboxs_p, 
-#         #     preds_gender=gender_preds_p, 
-#         #     pred_class_probs_gender=gender_probs_p.max(dim=-1).values,
-#         #     preds_race=race_preds_p, 
-#         #     pred_class_probs_race=race_probs_p.max(dim=-1).values,
-#         #     preds_age=age_preds_p, 
-#         #     pred_class_probs_age=age_probs_p.max(dim=-1).values,
-#         # )
+        # plot_in_grid_gender_race_age(
+        #     imgs_p, 
+        #     save_to, 
+        #     face_indicators=face_indicators_p, 
+        #     face_bboxs=face_bboxs_p, 
+        #     preds_gender=gender_preds_p, 
+        #     pred_class_probs_gender=gender_probs_p.max(dim=-1).values,
+        #     preds_race=race_preds_p, 
+        #     pred_class_probs_race=race_probs_p.max(dim=-1).values,
+        #     preds_age=age_preds_p, 
+        #     pred_class_probs_age=age_probs_p.max(dim=-1).values,
+        # )
 
-#         face_indicators_all[prompt_idx] = face_indicators_p.cpu()
-#         face_bboxs_all[prompt_idx] = face_bboxs_p.cpu()
-#         face_chips_all[prompt_idx] = face_chips_p.cpu()
-#         aligned_face_chips_all[prompt_idx] = aligned_face_chips_p.cpu()
-#         gender_logits_all[prompt_idx] = gender_logits_p.cpu()
-#         race_logits_all[prompt_idx] = race_logits_p.cpu()
-#         age_logits_all[prompt_idx] = age_logits_p.cpu()
+        face_indicators_all[prompt_idx] = face_indicators_p.cpu()
+        face_bboxs_all[prompt_idx] = face_bboxs_p.cpu()
+        face_chips_all[prompt_idx] = face_chips_p.cpu()
+        aligned_face_chips_all[prompt_idx] = aligned_face_chips_p.cpu()
+        gender_logits_all[prompt_idx] = gender_logits_p.cpu()
+        race_logits_all[prompt_idx] = race_logits_p.cpu()
+        age_logits_all[prompt_idx] = age_logits_p.cpu()
 
-#     # import pdb; pdb.set_trace()
-#     # (이부분)
-
-
-#     face_indicators_global = accelerator.gather_object(face_indicators_all)
-#     face_bboxs_global = accelerator.gather_object(face_bboxs_all)
-#     gender_logits_global = accelerator.gather_object(gender_logits_all)
-#     race_logits_global = accelerator.gather_object(race_logits_all)
-#     age_logits_global = accelerator.gather_object(age_logits_all)
-#     prompt_texts_global = accelerator.gather_object(prompt_texts_all)
+    # import pdb; pdb.set_trace()
+    # (이부분)
 
 
-#     if accelerator.is_main_process:
-#         def merge_dicts(dict_list):
-#             merged = {}
-#             for d in dict_list:
-#                 merged.update(d)
-#             return merged
-#         face_indicators_final = merge_dicts(face_indicators_global)
-#         face_bboxs_final = merge_dicts(face_bboxs_global)
-#         gender_logits_final = merge_dicts(gender_logits_global)
-#         race_logits_final = merge_dicts(race_logits_global)
-#         age_logits_final = merge_dicts(age_logits_global)
-#         prompt_texts_final = merge_dicts(prompt_texts_global)
+    face_indicators_global = accelerator.gather_object(face_indicators_all)
+    face_bboxs_global = accelerator.gather_object(face_bboxs_all)
+    gender_logits_global = accelerator.gather_object(gender_logits_all)
+    race_logits_global = accelerator.gather_object(race_logits_all)
+    age_logits_global = accelerator.gather_object(age_logits_all)
+    prompt_texts_global = accelerator.gather_object(prompt_texts_all)
 
-#         results = [face_indicators_final, face_bboxs_final, gender_logits_final, race_logits_final, age_logits_final, prompt_texts_final]
-#         save_to = os.path.join(args.test_results_dir, "test_results.pkl")
-#         with open(save_to, "wb") as f:
-#             pkl.dump(results, f)
+
+    if accelerator.is_main_process:
+        def merge_dicts(dict_list):
+            merged = {}
+            for d in dict_list:
+                merged.update(d)
+            return merged
+        face_indicators_final = merge_dicts(face_indicators_global)
+        face_bboxs_final = merge_dicts(face_bboxs_global)
+        gender_logits_final = merge_dicts(gender_logits_global)
+        race_logits_final = merge_dicts(race_logits_global)
+        age_logits_final = merge_dicts(age_logits_global)
+        prompt_texts_final = merge_dicts(prompt_texts_global)
+
+        results = [face_indicators_final, face_bboxs_final, gender_logits_final, race_logits_final, age_logits_final, prompt_texts_final]
+        save_to = os.path.join(args.test_results_dir, "test_results.pkl")
+        with open(save_to, "wb") as f:
+            pkl.dump(results, f)
             
 
-#         # === WandB Logging - Save all .jpg images to WandB ===
-#         if mode == "eval_images":
-#             # 찾고자 하는 모든 jpg 이미지 파일 경로를 리스트로 저장
-#             image_paths = sorted(glob.glob(os.path.join(args.test_results_dir, "*.jpg")))
+        # === WandB Logging - Save all .jpg images to WandB ===
+        if mode == "eval_images":
+            # 찾고자 하는 모든 jpg 이미지 파일 경로를 리스트로 저장
+            image_paths = sorted(glob.glob(os.path.join(args.test_results_dir, "*.jpg")))
 
-#             # wandb로 이미지를 로깅하기 위한 리스트
-#             wandb_images = []
+            # wandb로 이미지를 로깅하기 위한 리스트
+            wandb_images = []
             
-#             for image_path in image_paths:
-#                 # 이미지 이름 추출 (prompt index로 표시)
-#                 image_name_raw = os.path.basename(image_path)  # 예: prompt_0.jpg
-#                 prompt_idx = int(image_name_raw.split("_")[-1].split(".")[0])  # 숫자 부분만 추출
+            for image_path in image_paths:
+                # 이미지 이름 추출 (prompt index로 표시)
+                image_name_raw = os.path.basename(image_path)  # 예: prompt_0.jpg
+                prompt_idx = int(image_name_raw.split("_")[-1].split(".")[0])  # 숫자 부분만 추출
                 
-#                 # test_prompts에서 해당 인덱스의 텍스트를 가져옴
-#                 if prompt_idx < len(test_prompts):
-#                     image_name = test_prompts[prompt_idx]
-#                 else:
-#                     image_name = f"Prompt {prompt_idx}"  # 인덱스가 초과한 경우 예외 처리
+                # test_prompts에서 해당 인덱스의 텍스트를 가져옴
+                if prompt_idx < len(test_prompts):
+                    image_name = test_prompts[prompt_idx]
+                else:
+                    image_name = f"Prompt {prompt_idx}"  # 인덱스가 초과한 경우 예외 처리
 
-#                 # 이미지를 WandB로 로깅하기 위해 Image 객체로 변환
-#                 wandb_images.append(wandb.Image(image_path, caption=image_name))
+                # 이미지를 WandB로 로깅하기 위해 Image 객체로 변환
+                wandb_images.append(wandb.Image(image_path, caption=image_name))
             
-#             # # WandB에 한 번에 로그하기
-#             # wandb.log({"Generated Images": wandb_images})
+            # # WandB에 한 번에 로그하기
+            # wandb.log({"Generated Images": wandb_images})
 
-#         else: 
-#             results = [face_indicators_final, face_bboxs_final, gender_logits_final, race_logits_final, age_logits_final, prompt_texts_final]
-#             save_to = os.path.join(args.test_results_dir, "test_results.pkl")
-#             with open(save_to, "wb") as f:
-#                 pkl.dump(results, f)
+        else: 
+            results = [face_indicators_final, face_bboxs_final, gender_logits_final, race_logits_final, age_logits_final, prompt_texts_final]
+            save_to = os.path.join(args.test_results_dir, "test_results.pkl")
+            with open(save_to, "wb") as f:
+                pkl.dump(results, f)
 
-#             # 모든 프롬프트에 대해 편향 점수 계산
-#             prompt_bias_scores = calculate_bias_for_all_prompts(face_indicators_final, gender_logits_final, prompt_texts_final)
+            # 모든 프롬프트에 대해 편향 점수 계산
+            prompt_bias_scores = calculate_bias_for_all_prompts(face_indicators_final, gender_logits_final, prompt_texts_final)
 
-#             # DataFrame으로 변환
-#             df = pd.DataFrame(prompt_bias_scores)
+            # DataFrame으로 변환
+            df = pd.DataFrame(prompt_bias_scores)
 
-#             # CSV 파일로 저장
-#             save_csv_path = os.path.join(args.test_results_dir, "test_results.csv")
-#             df.to_csv(save_csv_path, index=False)
+            # CSV 파일로 저장
+            save_csv_path = os.path.join(args.test_results_dir, "test_results.csv")
+            df.to_csv(save_csv_path, index=False)
             
-#             print(f"✅ 편향 점수가 '{save_csv_path}' 파일로 저장되었습니다!")
+            print(f"✅ 편향 점수가 '{save_csv_path}' 파일로 저장되었습니다!")
             
-#             df = pd.read_csv(save_csv_path)
+            df = pd.read_csv(save_csv_path)
             
-#             # bias_score 컬럼이 있는지 확인
-#             if 'bias_score' not in df.columns:
-#                 raise ValueError("CSV 파일에 'bias_score' 컬럼이 없습니다.")
+            # bias_score 컬럼이 있는지 확인
+            if 'bias_score' not in df.columns:
+                raise ValueError("CSV 파일에 'bias_score' 컬럼이 없습니다.")
             
-#             # bias_score 값들 추출
-#             bias_scores = df['bias_score']
+            # bias_score 값들 추출
+            bias_scores = df['bias_score']
 
-#             # 최솟값, 평균값, 최댓값 계산
-#             min_score = bias_scores.min()
-#             mean_score = bias_scores.mean()
-#             median_score = bias_scores.median()
-#             max_score = bias_scores.max()
-#             variance_score = bias_scores.var()  # 분산 계산
+            # 최솟값, 평균값, 최댓값 계산
+            min_score = bias_scores.min()
+            mean_score = bias_scores.mean()
+            median_score = bias_scores.median()
+            max_score = bias_scores.max()
+            variance_score = bias_scores.var()  # 분산 계산
 
             
-#             # 결과 출력
-#             print(f"📊 Bias Score Analysis")
-#             print(f"  - 최소값 (Min): {min_score:.4f}")
-#             print(f"  - 평균값 (Mean): {mean_score:.4f}")
-#             print(f"  - 최대값 (Max): {max_score:.4f}")
-#             print(f"  - 중간값 (Median): {median_score:.4f}")
+            # 결과 출력
+            print(f"📊 Bias Score Analysis")
+            print(f"  - 최소값 (Min): {min_score:.4f}")
+            print(f"  - 평균값 (Mean): {mean_score:.4f}")
+            print(f"  - 최대값 (Max): {max_score:.4f}")
+            print(f"  - 중간값 (Median): {median_score:.4f}")
 
-#             # WandB에 로깅
-#             wandb.log({
-#                 "bias_score_mean": mean_score,
-#                 "bias_score_variance": variance_score,
-#             })
+            # WandB에 로깅
+            wandb.log({
+                "bias_score_mean": mean_score,
+                "bias_score_variance": variance_score,
+            })
 
-#         return mean_score, variance_score
+        return mean_score, variance_score
     
-#     else:
-#         return 0.0, 0.0
+    else:
+        return 0.0, 0.0
 
